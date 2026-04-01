@@ -1,0 +1,9 @@
+[package]
+name = "rustchain-crypto"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+
+[dependencies]
+ed25519-dalek.workspace = true
+serde.workspace = true

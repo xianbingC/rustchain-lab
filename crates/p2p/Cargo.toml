@@ -1,0 +1,9 @@
+[package]
+name = "rustchain-p2p"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+
+[dependencies]
+bincode.workspace = true
+serde.workspace = true

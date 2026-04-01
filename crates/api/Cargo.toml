@@ -1,0 +1,10 @@
+[package]
+name = "rustchain-api"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+axum.workspace = true
+tokio.workspace = true

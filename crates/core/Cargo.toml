@@ -1,0 +1,12 @@
+[package]
+name = "rustchain-core"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+
+[dependencies]
+chrono.workspace = true
+hex.workspace = true
+serde.workspace = true
+sha2.workspace = true
+thiserror.workspace = true

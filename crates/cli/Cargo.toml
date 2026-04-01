@@ -1,0 +1,8 @@
+[package]
+name = "rustchain-cli"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+
+[dependencies]
+anyhow.workspace = true
