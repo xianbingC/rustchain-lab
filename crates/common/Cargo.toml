@@ -1,10 +1,11 @@
 [package]
-name = "rustchain-cli"
+name = "rustchain-common"
 edition.workspace = true
 license.workspace = true
 version.workspace = true
 
 [dependencies]
-anyhow.workspace = true
-rustchain-common = { path = "../common" }
+serde.workspace = true
+thiserror.workspace = true
 tracing.workspace = true
+tracing-subscriber.workspace = true

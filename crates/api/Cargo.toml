@@ -7,4 +7,7 @@ version.workspace = true
 [dependencies]
 anyhow.workspace = true
 axum.workspace = true
+rustchain-common = { path = "../common" }
+serde_json.workspace = true
 tokio.workspace = true
+tracing.workspace = true

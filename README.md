@@ -19,6 +19,7 @@ rustchain-lab/
 │   ├── api/        # REST API service
 │   ├── apps/       # DeFi and NFT application logic
 │   ├── cli/        # Command-line interface
+│   ├── common/     # Shared config, logging, and app-level errors
 │   ├── core/       # Blocks, transactions, chain, consensus
 │   ├── crypto/     # Wallets, keys, signatures
 │   ├── p2p/        # Peer discovery, messaging, sync

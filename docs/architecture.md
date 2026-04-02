@@ -12,6 +12,12 @@ RustChain Lab is organized as a Rust workspace with focused crates for infrastru
 - Hashing, Merkle tree calculation, PoW, block validation
 - Mempool and chain verification
 
+### `crates/common`
+
+- Shared application configuration
+- Unified logging initialization
+- Reusable app-level error types
+
 ### `crates/storage`
 
 - Storage traits and adapters
