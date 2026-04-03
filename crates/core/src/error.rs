@@ -30,6 +30,13 @@ pub enum CoreError {
     /// 工作量证明不满足当前难度要求。
     #[error("工作量证明校验失败: index={index}")]
     InvalidProofOfWork { index: u64 },
+    /// 区块难度与链配置不一致。
+    #[error("区块难度不匹配: index={index}, expected={expected}, actual={actual}")]
+    InvalidBlockDifficulty {
+        index: u64,
+        expected: u32,
+        actual: u32,
+    },
     /// 区块索引不连续。
     #[error("区块索引不连续: expected={expected}, actual={actual}")]
     InvalidBlockIndex { expected: u64, actual: u64 },

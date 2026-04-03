@@ -9,6 +9,8 @@ use std::collections::HashMap;
 /// 区块链聚合结构，维护主链、交易池和已连接节点信息。
 #[derive(Debug, Clone)]
 pub struct Blockchain {
+    /// 链标识，用于区分不同部署环境。
+    pub chain_id: String,
     /// 当前主链。
     pub chain: Vec<Block>,
     /// 尚未打包的交易池。
@@ -19,6 +21,8 @@ pub struct Blockchain {
     pub difficulty: u32,
     /// 出块奖励。
     pub mining_reward: u64,
+    /// 目标出块时间（秒），用于后续动态难度调整。
+    pub target_block_time_secs: u64,
 }
 
 impl Default for Blockchain {
@@ -31,11 +35,13 @@ impl Blockchain {
     /// 初始化新区块链，并自动创建创世区块。
     pub fn new(difficulty: u32, mining_reward: u64) -> Self {
         Self {
+            chain_id: "rustchain-lab-dev".to_string(),
             chain: vec![Block::genesis()],
             pending_transactions: Vec::new(),
             peers: Vec::new(),
             difficulty,
             mining_reward,
+            target_block_time_secs: 10,
         }
     }
 
@@ -70,7 +76,7 @@ impl Blockchain {
     /// 将当前交易池打包为新区块，并发放挖矿奖励。
     pub fn mine_pending_transactions(&mut self, miner_address: impl Into<String>) -> CoreResult<Block> {
         let miner_address = miner_address.into();
-        let reward_tx = Transaction::system(miner_address, self.mining_reward, None);
+        let reward_tx = Transaction::system(miner_address.clone(), self.mining_reward, None);
 
         let mut block_transactions = self.pending_transactions.clone();
         block_transactions.push(reward_tx);
@@ -80,6 +86,8 @@ impl Blockchain {
             previous_block.index + 1,
             block_transactions,
             previous_block.hash.clone(),
+            self.difficulty,
+            miner_address,
         );
         candidate_block.mine(self.difficulty);
 
@@ -112,7 +120,7 @@ impl Blockchain {
 
         for (index, block) in self.chain.iter().enumerate() {
             let is_genesis = index == 0;
-            block.validate_integrity(self.difficulty, is_genesis)?;
+            block.validate_integrity(is_genesis)?;
 
             if !is_genesis {
                 let previous = &self.chain[index - 1];
@@ -127,6 +135,14 @@ impl Blockchain {
                 if block.previous_hash != previous.hash {
                     return Err(CoreError::InvalidPreviousHash { index: block.index });
                 }
+
+                if block.difficulty != self.difficulty {
+                    return Err(CoreError::InvalidBlockDifficulty {
+                        index: block.index,
+                        expected: self.difficulty,
+                        actual: block.difficulty,
+                    });
+                }
             }
 
             self.apply_transactions_to_balances(&block.transactions, &mut balances)?;
@@ -138,7 +154,7 @@ impl Blockchain {
     /// 校验一个候选新区块是否可以追加到当前主链。
     pub fn validate_next_block(&self, block: &Block) -> CoreResult<()> {
         let latest = self.latest_block()?;
-        block.validate_integrity(self.difficulty, false)?;
+        block.validate_integrity(false)?;
 
         if block.index != latest.index + 1 {
             return Err(CoreError::InvalidBlockIndex {
@@ -149,6 +165,14 @@ impl Blockchain {
 
         if block.previous_hash != latest.hash {
             return Err(CoreError::InvalidPreviousHash { index: block.index });
+        }
+
+        if block.difficulty != self.difficulty {
+            return Err(CoreError::InvalidBlockDifficulty {
+                index: block.index,
+                expected: self.difficulty,
+                actual: block.difficulty,
+            });
         }
 
         let mut balances = self.balances();
@@ -245,5 +269,24 @@ mod tests {
         let result = blockchain.add_transaction(tx);
 
         assert_eq!(result, Err(CoreError::ReservedSystemAddress));
+    }
+
+    /// 验证候选区块难度与链配置不一致时会被拒绝。
+    #[test]
+    fn candidate_block_with_invalid_difficulty_should_be_rejected() {
+        let blockchain = Blockchain::new(2, 50);
+        let latest = blockchain.latest_block().expect("应当存在创世区块");
+        let mut block = Block::new(1, Vec::new(), latest.hash.clone(), 1, "miner-1");
+        block.mine(1);
+
+        let result = blockchain.validate_next_block(&block);
+        assert_eq!(
+            result,
+            Err(CoreError::InvalidBlockDifficulty {
+                index: 1,
+                expected: 2,
+                actual: 1,
+            })
+        );
     }
 }
