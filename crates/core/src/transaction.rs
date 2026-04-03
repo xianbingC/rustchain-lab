@@ -5,17 +5,56 @@ use serde::{Deserialize, Serialize};
 /// 系统奖励交易使用的发送方地址。
 pub const SYSTEM_ADDRESS: &str = "__system__";
 
+/// 交易类型，用于在不破坏底层结构的前提下区分业务语义。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TransactionKind {
+    /// 普通转账交易。
+    Transfer,
+    /// 合约部署交易。
+    ContractDeploy,
+    /// 合约调用交易。
+    ContractCall,
+    /// DeFi 业务动作交易。
+    DefiAction,
+    /// NFT 铸造交易。
+    NftMint,
+    /// NFT 转移交易。
+    NftTransfer,
+    /// 系统奖励交易。
+    SystemReward,
+}
+
+impl TransactionKind {
+    /// 返回交易类型的稳定字符串表示，用于交易 ID 计算。
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Transfer => "transfer",
+            Self::ContractDeploy => "contract_deploy",
+            Self::ContractCall => "contract_call",
+            Self::DefiAction => "defi_action",
+            Self::NftMint => "nft_mint",
+            Self::NftTransfer => "nft_transfer",
+            Self::SystemReward => "system_reward",
+        }
+    }
+}
+
 /// 链上交易数据结构。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Transaction {
     /// 交易唯一标识。
     pub id: String,
+    /// 交易类型。
+    pub kind: TransactionKind,
     /// 发送者地址。
     pub from: String,
     /// 接收者地址。
     pub to: String,
     /// 转账金额。
     pub amount: u64,
+    /// 账户交易序号，用于后续防重放扩展。
+    pub nonce: u64,
     /// 交易创建时间戳。
     pub timestamp: i64,
     /// 交易签名，原型阶段使用十六进制字符串表示。
@@ -25,13 +64,39 @@ pub struct Transaction {
 }
 
 impl Transaction {
-    /// 创建一笔普通交易，并立即生成初始交易 ID。
-    pub fn new(from: impl Into<String>, to: impl Into<String>, amount: u64, payload: Option<Vec<u8>>) -> Self {
+    /// 创建一笔普通转账交易，并立即生成初始交易 ID。
+    pub fn new(
+        from: impl Into<String>,
+        to: impl Into<String>,
+        amount: u64,
+        payload: Option<Vec<u8>>,
+    ) -> Self {
+        Self::new_with_kind(
+            TransactionKind::Transfer,
+            from,
+            to,
+            amount,
+            0,
+            payload,
+        )
+    }
+
+    /// 创建自定义类型交易，便于后续合约、DeFi、NFT 场景复用。
+    pub fn new_with_kind(
+        kind: TransactionKind,
+        from: impl Into<String>,
+        to: impl Into<String>,
+        amount: u64,
+        nonce: u64,
+        payload: Option<Vec<u8>>,
+    ) -> Self {
         let mut tx = Self {
             id: String::new(),
+            kind,
             from: from.into(),
             to: to.into(),
             amount,
+            nonce,
             timestamp: Utc::now().timestamp(),
             signature: None,
             payload,
@@ -44,9 +109,11 @@ impl Transaction {
     pub fn system(to: impl Into<String>, amount: u64, payload: Option<Vec<u8>>) -> Self {
         let mut tx = Self {
             id: String::new(),
+            kind: TransactionKind::SystemReward,
             from: SYSTEM_ADDRESS.to_string(),
             to: to.into(),
             amount,
+            nonce: 0,
             timestamp: Utc::now().timestamp(),
             signature: None,
             payload,
@@ -60,8 +127,14 @@ impl Transaction {
         let payload_hex = self.payload.as_deref().map(hex::encode).unwrap_or_default();
 
         format!(
-            "{}|{}|{}|{}|{}",
-            self.from, self.to, self.amount, self.timestamp, payload_hex
+            "{}|{}|{}|{}|{}|{}|{}",
+            self.kind.as_str(),
+            self.from,
+            self.to,
+            self.amount,
+            self.nonce,
+            self.timestamp,
+            payload_hex
         )
         .into_bytes()
     }
@@ -71,10 +144,7 @@ impl Transaction {
         let signing_payload = self.signing_payload();
         let signature = self.signature.as_deref().unwrap_or_default();
 
-        sha256_hex_parts(&[
-            signing_payload.as_slice(),
-            signature.as_bytes(),
-        ])
+        sha256_hex_parts(&[signing_payload.as_slice(), signature.as_bytes()])
     }
 
     /// 交易签名更新后，需要同步刷新交易 ID。
@@ -84,7 +154,7 @@ impl Transaction {
 
     /// 判断是否为系统交易。
     pub fn is_system(&self) -> bool {
-        self.from == SYSTEM_ADDRESS
+        self.kind == TransactionKind::SystemReward || self.from == SYSTEM_ADDRESS
     }
 
     /// 验证交易的基础结构是否合法。
@@ -121,6 +191,31 @@ mod tests {
         let tx = Transaction::new("alice", "bob", 10, Some(vec![1, 2, 3]));
 
         assert!(!tx.id.is_empty());
+        assert_eq!(tx.kind, TransactionKind::Transfer);
+        assert_eq!(tx.nonce, 0);
         assert!(tx.validate_basic().is_ok());
+    }
+
+    /// 验证交易类型和 nonce 参与交易 ID 计算，避免不同业务被误判为同一交易。
+    #[test]
+    fn transaction_kind_and_nonce_should_affect_transaction_id() {
+        let tx1 = Transaction::new_with_kind(
+            TransactionKind::ContractCall,
+            "alice",
+            "contract-1",
+            1,
+            7,
+            Some(vec![0xAA]),
+        );
+        let tx2 = Transaction::new_with_kind(
+            TransactionKind::ContractCall,
+            "alice",
+            "contract-1",
+            1,
+            8,
+            Some(vec![0xAA]),
+        );
+
+        assert_ne!(tx1.id, tx2.id);
     }
 }
