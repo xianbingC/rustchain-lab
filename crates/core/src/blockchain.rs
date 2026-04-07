@@ -60,7 +60,7 @@ impl Blockchain {
 
     /// 将合法交易加入交易池。
     pub fn add_transaction(&mut self, transaction: Transaction) -> CoreResult<()> {
-        transaction.validate_basic()?;
+        transaction.validate_for_chain()?;
         if transaction.is_system() {
             return Err(CoreError::ReservedSystemAddress);
         }
@@ -200,7 +200,7 @@ impl Blockchain {
         transaction: &Transaction,
         balances: &mut HashMap<String, u64>,
     ) -> CoreResult<()> {
-        transaction.validate_basic()?;
+        transaction.validate_for_chain()?;
 
         if !transaction.is_system() {
             let available = balances.get(&transaction.from).copied().unwrap_or(0);
@@ -228,6 +228,7 @@ impl Blockchain {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rustchain_crypto::wallet::create_wallet;
 
     /// 验证系统奖励出块后，矿工余额能够正确增加。
     #[test]
@@ -245,19 +246,35 @@ mod tests {
     /// 验证在已有余额的前提下，普通转账和整链校验都能通过。
     #[test]
     fn transfer_flow_should_keep_chain_valid() {
+        let (alice_wallet, alice_key_pair) = create_wallet("alice-pass").expect("创建钱包应当成功");
+        let (bob_wallet, _) = create_wallet("bob-pass").expect("创建钱包应当成功");
         let mut blockchain = Blockchain::new(1, 50);
         blockchain
-            .mine_pending_transactions("alice")
+            .mine_pending_transactions(alice_wallet.address.clone())
             .expect("第一次挖矿应当成功");
 
-        let tx = Transaction::new("alice", "bob", 20, None);
+        let mut tx = Transaction::new(alice_wallet.address.clone(), bob_wallet.address.clone(), 20, None);
+        tx.sign_with_private_key(&alice_key_pair.private_key, &alice_key_pair.public_key)
+            .expect("交易签名应当成功");
         blockchain.add_transaction(tx).expect("交易应当可以入池");
         blockchain
             .mine_pending_transactions("miner-2")
             .expect("第二次挖矿应当成功");
 
-        assert_eq!(blockchain.balances().get("alice").copied(), Some(30));
-        assert_eq!(blockchain.balances().get("bob").copied(), Some(20));
+        assert_eq!(
+            blockchain
+                .balances()
+                .get(&alice_wallet.address)
+                .copied(),
+            Some(30)
+        );
+        assert_eq!(
+            blockchain
+                .balances()
+                .get(&bob_wallet.address)
+                .copied(),
+            Some(20)
+        );
         assert!(blockchain.validate_chain().is_ok());
     }
 

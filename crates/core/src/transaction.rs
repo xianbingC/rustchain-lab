@@ -1,5 +1,9 @@
 use crate::{hash::sha256_hex_parts, CoreResult};
 use chrono::Utc;
+use rustchain_crypto::{
+    signature::{sign_message, verify_message},
+    wallet::derive_address_from_public_key,
+};
 use serde::{Deserialize, Serialize};
 
 /// 系统奖励交易使用的发送方地址。
@@ -59,6 +63,8 @@ pub struct Transaction {
     pub timestamp: i64,
     /// 交易签名，原型阶段使用十六进制字符串表示。
     pub signature: Option<String>,
+    /// 发送者公钥，使用十六进制字符串表示。
+    pub sender_public_key: Option<String>,
     /// 扩展数据字段，可承载合约调用等业务信息。
     pub payload: Option<Vec<u8>>,
 }
@@ -99,6 +105,7 @@ impl Transaction {
             nonce,
             timestamp: Utc::now().timestamp(),
             signature: None,
+            sender_public_key: None,
             payload,
         };
         tx.refresh_id();
@@ -116,6 +123,7 @@ impl Transaction {
             nonce: 0,
             timestamp: Utc::now().timestamp(),
             signature: None,
+            sender_public_key: None,
             payload,
         };
         tx.refresh_id();
@@ -125,15 +133,17 @@ impl Transaction {
     /// 为签名阶段生成稳定的消息摘要输入。
     pub fn signing_payload(&self) -> Vec<u8> {
         let payload_hex = self.payload.as_deref().map(hex::encode).unwrap_or_default();
+        let sender_public_key = self.sender_public_key.as_deref().unwrap_or_default();
 
         format!(
-            "{}|{}|{}|{}|{}|{}|{}",
+            "{}|{}|{}|{}|{}|{}|{}|{}",
             self.kind.as_str(),
             self.from,
             self.to,
             self.amount,
             self.nonce,
             self.timestamp,
+            sender_public_key,
             payload_hex
         )
         .into_bytes()
@@ -150,6 +160,21 @@ impl Transaction {
     /// 交易签名更新后，需要同步刷新交易 ID。
     pub fn refresh_id(&mut self) {
         self.id = self.calculate_id();
+    }
+
+    /// 使用私钥对交易进行签名，并同步记录发送者公钥。
+    pub fn sign_with_private_key(
+        &mut self,
+        private_key_hex: &str,
+        sender_public_key_hex: &str,
+    ) -> CoreResult<()> {
+        self.sender_public_key = Some(sender_public_key_hex.to_string());
+        let message = self.signing_payload();
+        let signature = sign_message(&message, private_key_hex)
+            .map_err(|error| crate::error::CoreError::CryptoOperationFailed(error.to_string()))?;
+        self.signature = Some(signature);
+        self.refresh_id();
+        Ok(())
     }
 
     /// 判断是否为系统交易。
@@ -179,11 +204,49 @@ impl Transaction {
 
         Ok(())
     }
+
+    /// 验证交易签名与地址是否匹配。
+    pub fn validate_signature(&self) -> CoreResult<()> {
+        if self.is_system() {
+            return Ok(());
+        }
+
+        let signature = self
+            .signature
+            .as_deref()
+            .ok_or(crate::error::CoreError::MissingSignature)?;
+        let sender_public_key = self
+            .sender_public_key
+            .as_deref()
+            .ok_or(crate::error::CoreError::MissingSenderPublicKey)?;
+
+        let derived_address = derive_address_from_public_key(sender_public_key).map_err(|error| {
+            crate::error::CoreError::CryptoOperationFailed(error.to_string())
+        })?;
+        if self.from != derived_address {
+            return Err(crate::error::CoreError::SenderAddressMismatch);
+        }
+
+        let verified = verify_message(&self.signing_payload(), signature, sender_public_key)
+            .map_err(|error| crate::error::CoreError::CryptoOperationFailed(error.to_string()))?;
+        if !verified {
+            return Err(crate::error::CoreError::InvalidTransactionSignature);
+        }
+
+        Ok(())
+    }
+
+    /// 链级校验入口：包含结构校验和签名校验。
+    pub fn validate_for_chain(&self) -> CoreResult<()> {
+        self.validate_basic()?;
+        self.validate_signature()
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rustchain_crypto::wallet::create_wallet;
 
     /// 验证新交易会立即生成合法 ID，并通过基础校验。
     #[test]
@@ -217,5 +280,28 @@ mod tests {
         );
 
         assert_ne!(tx1.id, tx2.id);
+    }
+
+    /// 验证普通交易签名后可通过链级校验。
+    #[test]
+    fn signed_transaction_should_pass_chain_validation() {
+        let (wallet, key_pair) = create_wallet("tx-sign-pass").expect("创建钱包应当成功");
+        let mut tx = Transaction::new(wallet.address, "0xreceiver", 11, None);
+        tx.sign_with_private_key(&key_pair.private_key, &key_pair.public_key)
+            .expect("签名应当成功");
+
+        assert!(tx.validate_for_chain().is_ok());
+    }
+
+    /// 验证未签名普通交易无法通过链级校验。
+    #[test]
+    fn unsigned_transaction_should_fail_chain_validation() {
+        let (wallet, _) = create_wallet("tx-sign-pass").expect("创建钱包应当成功");
+        let tx = Transaction::new(wallet.address, "0xreceiver", 11, None);
+
+        assert_eq!(
+            tx.validate_for_chain(),
+            Err(crate::error::CoreError::MissingSignature)
+        );
     }
 }

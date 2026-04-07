@@ -7,4 +7,7 @@ version.workspace = true
 [dependencies]
 anyhow.workspace = true
 rustchain-common = { path = "../common" }
+rustchain-core = { path = "../core" }
+rustchain-crypto = { path = "../crypto" }
+serde_json.workspace = true
 tracing.workspace = true

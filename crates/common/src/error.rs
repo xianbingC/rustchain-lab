@@ -12,6 +12,9 @@ pub enum AppError {
     /// 日志系统初始化失败。
     #[error("日志初始化失败: {0}")]
     Logging(String),
+    /// CLI 或应用命令执行失败。
+    #[error("命令执行失败: {0}")]
+    Command(String),
 }
 
 /// 全项目统一的返回结果类型。

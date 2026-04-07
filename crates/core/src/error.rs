@@ -15,6 +15,18 @@ pub enum CoreError {
     /// 交易必须提供接收方地址。
     #[error("交易缺少接收方地址")]
     MissingRecipient,
+    /// 普通交易必须提供签名。
+    #[error("普通交易缺少签名")]
+    MissingSignature,
+    /// 普通交易必须提供发送者公钥。
+    #[error("普通交易缺少发送者公钥")]
+    MissingSenderPublicKey,
+    /// 发送者地址与发送者公钥不匹配。
+    #[error("发送者地址与公钥不匹配")]
+    SenderAddressMismatch,
+    /// 交易签名无效。
+    #[error("交易签名无效")]
+    InvalidTransactionSignature,
     /// 交易 ID 与重新计算后的结果不一致。
     #[error("交易 ID 校验失败: {0}")]
     InvalidTransactionId(String),
@@ -53,4 +65,7 @@ pub enum CoreError {
     /// 创世区块不符合预期。
     #[error("创世区块内容不合法")]
     InvalidGenesisBlock,
+    /// 加密相关处理失败。
+    #[error("加密处理失败: {0}")]
+    CryptoOperationFailed(String),
 }

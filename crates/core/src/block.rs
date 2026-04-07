@@ -156,7 +156,7 @@ impl Block {
         }
 
         for tx in &self.transactions {
-            tx.validate_basic()?;
+            tx.validate_for_chain()?;
         }
 
         Ok(())
@@ -171,7 +171,7 @@ mod tests {
     /// 验证区块在挖矿后能满足难度要求，并通过完整性校验。
     #[test]
     fn mined_block_should_pass_integrity_check() {
-        let tx = Transaction::new("alice", "bob", 10, None);
+        let tx = Transaction::system("miner-1", 10, None);
         let mut block = Block::new(1, vec![tx], "prev-hash", 1, "miner-1");
         block.mine(1);
 

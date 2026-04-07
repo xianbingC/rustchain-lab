@@ -5,5 +5,9 @@ license.workspace = true
 version.workspace = true
 
 [dependencies]
-ed25519-dalek.workspace = true
+ed25519-dalek = { workspace = true, features = ["rand_core"] }
+hex.workspace = true
+rand = "0.8"
 serde.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
