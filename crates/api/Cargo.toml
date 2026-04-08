@@ -8,6 +8,9 @@ version.workspace = true
 anyhow.workspace = true
 axum.workspace = true
 rustchain-common = { path = "../common" }
+rustchain-core = { path = "../core" }
+rustchain-crypto = { path = "../crypto" }
+serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
 tracing.workspace = true
