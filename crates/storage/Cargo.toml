@@ -4,6 +4,16 @@ edition.workspace = true
 license.workspace = true
 version.workspace = true
 
+[features]
+default = []
+rocksdb-backend = ["dep:rocksdb"]
+
 [dependencies]
 anyhow.workspace = true
+rocksdb = { workspace = true, optional = true }
+rusty-leveldb.workspace = true
 serde.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
