@@ -79,10 +79,9 @@ impl Runtime {
                     pc = *target;
                 }
                 Opcode::JumpIfFalse(target) => {
-                    let condition = self
-                        .stack
-                        .pop()
-                        .ok_or(VmError::StackUnderflow { opcode: "jump_if_false" })?;
+                    let condition = self.stack.pop().ok_or(VmError::StackUnderflow {
+                        opcode: "jump_if_false",
+                    })?;
 
                     if condition == 0 {
                         if *target >= program.len() {
