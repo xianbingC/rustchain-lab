@@ -56,10 +56,39 @@ pub fn compile(source: &str) -> Result<Vec<Opcode>, CompileError> {
                     })?;
                 Opcode::LoadConst(value)
             }
+            "LOAD" => {
+                let key = required_operand(line_no, "LOAD", operand)?;
+                ensure_no_space_operand(line_no, "LOAD", key)?;
+                Opcode::Load(key.to_string())
+            }
             "STORE" => {
                 let key = required_operand(line_no, "STORE", operand)?;
                 ensure_no_space_operand(line_no, "STORE", key)?;
                 Opcode::Store(key.to_string())
+            }
+            "ADD" => {
+                ensure_empty_operand(line_no, "ADD", operand)?;
+                Opcode::Add
+            }
+            "SUB" => {
+                ensure_empty_operand(line_no, "SUB", operand)?;
+                Opcode::Sub
+            }
+            "MUL" => {
+                ensure_empty_operand(line_no, "MUL", operand)?;
+                Opcode::Mul
+            }
+            "DIV" => {
+                ensure_empty_operand(line_no, "DIV", operand)?;
+                Opcode::Div
+            }
+            "EQ" => {
+                ensure_empty_operand(line_no, "EQ", operand)?;
+                Opcode::Eq
+            }
+            "GT" => {
+                ensure_empty_operand(line_no, "GT", operand)?;
+                Opcode::Gt
             }
             "JUMP" => {
                 let raw_target = required_operand(line_no, "JUMP", operand)?;
@@ -94,13 +123,7 @@ pub fn compile(source: &str) -> Result<Vec<Opcode>, CompileError> {
                 Opcode::Emit(trim_wrapped_quotes(event).to_string())
             }
             "HALT" => {
-                if !operand.is_empty() {
-                    return Err(CompileError::UnexpectedOperand {
-                        line: line_no,
-                        opcode: "HALT",
-                        value: operand.to_string(),
-                    });
-                }
+                ensure_empty_operand(line_no, "HALT", operand)?;
                 Opcode::Halt
             }
             _ => {
@@ -136,6 +159,22 @@ fn ensure_no_space_operand(
     operand: &str,
 ) -> Result<(), CompileError> {
     if operand.split_whitespace().count() > 1 {
+        return Err(CompileError::UnexpectedOperand {
+            line,
+            opcode,
+            value: operand.to_string(),
+        });
+    }
+    Ok(())
+}
+
+/// 校验无需操作数的指令。
+fn ensure_empty_operand(
+    line: usize,
+    opcode: &'static str,
+    operand: &str,
+) -> Result<(), CompileError> {
+    if !operand.is_empty() {
         return Err(CompileError::UnexpectedOperand {
             line,
             opcode,
@@ -226,6 +265,36 @@ mod tests {
                 Opcode::LoadConst(1),
                 Opcode::Store("flag".to_string()),
                 Opcode::Emit("flag initialized".to_string()),
+                Opcode::Halt,
+            ]
+        );
+    }
+
+    /// 验证算术与比较指令可以被正确编译。
+    #[test]
+    fn arithmetic_program_should_compile() {
+        let source = r#"
+            LOAD_CONST 10
+            LOAD_CONST 4
+            SUB
+            STORE gap
+            LOAD gap
+            LOAD_CONST 6
+            EQ
+            HALT
+        "#;
+
+        let result = compile(source).expect("编译应当成功");
+        assert_eq!(
+            result,
+            vec![
+                Opcode::LoadConst(10),
+                Opcode::LoadConst(4),
+                Opcode::Sub,
+                Opcode::Store("gap".to_string()),
+                Opcode::Load("gap".to_string()),
+                Opcode::LoadConst(6),
+                Opcode::Eq,
                 Opcode::Halt,
             ]
         );

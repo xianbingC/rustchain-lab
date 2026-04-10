@@ -25,6 +25,12 @@ pub enum VmError {
     /// 超出执行步数限制，防止无限循环。
     #[error("执行步数超限: limit={limit}")]
     StepLimitExceeded { limit: usize },
+    /// 状态变量不存在。
+    #[error("状态变量不存在: key={key}")]
+    StateKeyNotFound { key: String },
+    /// 除零错误。
+    #[error("除零错误")]
+    DivisionByZero,
 }
 
 /// 合约运行时，维护栈、状态和事件输出。
@@ -61,12 +67,54 @@ impl Runtime {
                     self.stack.push(*value);
                     pc = pc.saturating_add(1);
                 }
+                Opcode::Load(key) => {
+                    let value = self
+                        .state
+                        .get(key)
+                        .copied()
+                        .ok_or_else(|| VmError::StateKeyNotFound { key: key.clone() })?;
+                    self.stack.push(value);
+                    pc = pc.saturating_add(1);
+                }
                 Opcode::Store(key) => {
                     let value = self
                         .stack
                         .pop()
                         .ok_or(VmError::StackUnderflow { opcode: "store" })?;
                     self.state.insert(key.clone(), value);
+                    pc = pc.saturating_add(1);
+                }
+                Opcode::Add => {
+                    let (lhs, rhs) = self.pop_binary_operands("add")?;
+                    self.stack.push(lhs.saturating_add(rhs));
+                    pc = pc.saturating_add(1);
+                }
+                Opcode::Sub => {
+                    let (lhs, rhs) = self.pop_binary_operands("sub")?;
+                    self.stack.push(lhs.saturating_sub(rhs));
+                    pc = pc.saturating_add(1);
+                }
+                Opcode::Mul => {
+                    let (lhs, rhs) = self.pop_binary_operands("mul")?;
+                    self.stack.push(lhs.saturating_mul(rhs));
+                    pc = pc.saturating_add(1);
+                }
+                Opcode::Div => {
+                    let (lhs, rhs) = self.pop_binary_operands("div")?;
+                    if rhs == 0 {
+                        return Err(VmError::DivisionByZero);
+                    }
+                    self.stack.push(lhs / rhs);
+                    pc = pc.saturating_add(1);
+                }
+                Opcode::Eq => {
+                    let (lhs, rhs) = self.pop_binary_operands("eq")?;
+                    self.stack.push(if lhs == rhs { 1 } else { 0 });
+                    pc = pc.saturating_add(1);
+                }
+                Opcode::Gt => {
+                    let (lhs, rhs) = self.pop_binary_operands("gt")?;
+                    self.stack.push(if lhs > rhs { 1 } else { 0 });
                     pc = pc.saturating_add(1);
                 }
                 Opcode::Jump(target) => {
@@ -124,6 +172,13 @@ impl Runtime {
     /// 只读访问事件列表。
     pub fn events(&self) -> &[String] {
         &self.events
+    }
+
+    /// 弹出双操作数（先弹右值，再弹左值）。
+    fn pop_binary_operands(&mut self, opcode: &'static str) -> Result<(i64, i64), VmError> {
+        let rhs = self.stack.pop().ok_or(VmError::StackUnderflow { opcode })?;
+        let lhs = self.stack.pop().ok_or(VmError::StackUnderflow { opcode })?;
+        Ok((lhs, rhs))
     }
 }
 
@@ -188,5 +243,76 @@ mod tests {
 
         let result = runtime.execute_with_limit(&program, 3);
         assert_eq!(result, Err(VmError::StepLimitExceeded { limit: 3 }));
+    }
+
+    /// 验证算术与比较指令可以联动执行。
+    #[test]
+    fn arithmetic_and_compare_should_work() {
+        let mut runtime = Runtime::default();
+        let program = vec![
+            Opcode::LoadConst(8),
+            Opcode::LoadConst(3),
+            Opcode::Sub,
+            Opcode::Store("delta".to_string()),
+            Opcode::Load("delta".to_string()),
+            Opcode::LoadConst(5),
+            Opcode::Eq,
+            Opcode::Store("is_five".to_string()),
+            Opcode::Halt,
+        ];
+
+        runtime.execute(&program).expect("执行应当成功");
+        assert_eq!(runtime.state().get("delta"), Some(&5));
+        assert_eq!(runtime.state().get("is_five"), Some(&1));
+    }
+
+    /// 验证循环逻辑可以通过跳转完成计数递减。
+    #[test]
+    fn loop_with_jump_should_work() {
+        let mut runtime = Runtime::default();
+        let program = vec![
+            Opcode::LoadConst(3),            // 0
+            Opcode::Store("counter".into()), // 1
+            Opcode::Load("counter".into()),  // 2
+            Opcode::LoadConst(0),            // 3
+            Opcode::Gt,                      // 4
+            Opcode::JumpIfFalse(12),         // 5
+            Opcode::Load("counter".into()),  // 6
+            Opcode::LoadConst(1),            // 7
+            Opcode::Sub,                     // 8
+            Opcode::Store("counter".into()), // 9
+            Opcode::Emit("tick".into()),     // 10
+            Opcode::Jump(2),                 // 11
+            Opcode::Halt,                    // 12
+        ];
+
+        runtime.execute(&program).expect("执行应当成功");
+        assert_eq!(runtime.state().get("counter"), Some(&0));
+        assert_eq!(runtime.events().len(), 3);
+    }
+
+    /// 验证除零会返回执行错误。
+    #[test]
+    fn divide_by_zero_should_fail() {
+        let mut runtime = Runtime::default();
+        let program = vec![Opcode::LoadConst(7), Opcode::LoadConst(0), Opcode::Div];
+
+        let result = runtime.execute(&program);
+        assert_eq!(result, Err(VmError::DivisionByZero));
+    }
+
+    /// 验证读取不存在的状态变量会报错。
+    #[test]
+    fn load_missing_state_should_fail() {
+        let mut runtime = Runtime::default();
+        let program = vec![Opcode::Load("missing".to_string())];
+
+        let result = runtime.execute(&program);
+        assert_eq!(
+            result,
+            Err(VmError::StateKeyNotFound {
+                key: "missing".to_string()
+            })
+        );
     }
 }
