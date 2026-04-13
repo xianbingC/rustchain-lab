@@ -9,5 +9,6 @@ anyhow.workspace = true
 rustchain-common = { path = "../common" }
 rustchain-core = { path = "../core" }
 rustchain-crypto = { path = "../crypto" }
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
 serde_json.workspace = true
 tracing.workspace = true
