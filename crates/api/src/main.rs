@@ -146,12 +146,15 @@ fn build_app(shared_state: AppState) -> Router {
         .route("/defi/withdraw", post(defi_withdraw_handler))
         .route("/defi/liquidate", post(defi_liquidate_handler))
         .route("/defi/position/:owner", get(defi_position_handler))
+        .route("/defi/stats", get(defi_stats_handler))
         .route("/nft/mint", post(nft_mint_handler))
         .route("/nft/list", post(nft_list_handler))
         .route("/nft/cancel", post(nft_cancel_handler))
         .route("/nft/buy", post(nft_buy_handler))
         .route("/nft/token/:token_id", get(nft_token_handler))
         .route("/nft/listing/:listing_id", get(nft_listing_handler))
+        .route("/nft/listings/active", get(nft_active_listings_handler))
+        .route("/nft/owner/:owner/tokens", get(nft_owner_tokens_handler))
         .with_state(shared_state)
 }
 
@@ -207,6 +210,19 @@ struct DefiPositionResponse {
     debt_amount: u64,
     /// 抵押率（bps）。
     collateral_ratio_bps: u64,
+}
+
+/// DeFi 池统计响应。
+#[derive(Debug, Serialize)]
+struct DefiPoolStatsResponse {
+    /// 总抵押。
+    total_collateral: u64,
+    /// 总债务。
+    total_debt: u64,
+    /// 当前借款年化利率（bps）。
+    borrow_rate_bps: u64,
+    /// 已开仓位数量。
+    position_count: usize,
 }
 
 /// DeFi 抵押接口。
@@ -416,6 +432,28 @@ async fn defi_position_handler(
     }
 }
 
+/// DeFi 池统计接口。
+async fn defi_stats_handler(
+    State(state): State<AppState>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    match with_pool(&state, |pool| {
+        let stats = DefiPoolStatsResponse {
+            total_collateral: pool.total_collateral,
+            total_debt: pool.total_debt,
+            borrow_rate_bps: pool.current_borrow_rate_bps(),
+            position_count: pool.positions.len(),
+        };
+
+        Ok(json!({
+            "ok": true,
+            "stats": stats
+        }))
+    }) {
+        Ok(body) => (StatusCode::OK, Json(body)),
+        Err((status, body)) => (status, Json(body)),
+    }
+}
+
 /// NFT 铸造请求。
 #[derive(Debug, Deserialize)]
 struct NftMintRequest {
@@ -572,6 +610,59 @@ async fn nft_listing_handler(
         Ok(json!({
             "ok": true,
             "listing": listing
+        }))
+    }) {
+        Ok(body) => (StatusCode::OK, Json(body)),
+        Err((status, body)) => (status, Json(body)),
+    }
+}
+
+/// NFT 查询活跃挂单接口。
+async fn nft_active_listings_handler(
+    State(state): State<AppState>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    match with_market(&state, |market| {
+        let active_listings: Vec<_> = market
+            .listings
+            .values()
+            .filter(|listing| listing.status == rustchain_apps::nft::ListingStatus::Active)
+            .cloned()
+            .collect();
+        Ok(json!({
+            "ok": true,
+            "listings": active_listings
+        }))
+    }) {
+        Ok(body) => (StatusCode::OK, Json(body)),
+        Err((status, body)) => (status, Json(body)),
+    }
+}
+
+/// NFT 查询用户资产接口。
+async fn nft_owner_tokens_handler(
+    State(state): State<AppState>,
+    Path(owner): Path<String>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    if owner.trim().is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "ok": false,
+                "error": "owner 不能为空"
+            })),
+        );
+    }
+
+    match with_market(&state, |market| {
+        let tokens: Vec<_> = market
+            .tokens
+            .values()
+            .filter(|token| token.owner == owner)
+            .cloned()
+            .collect();
+        Ok(json!({
+            "ok": true,
+            "tokens": tokens
         }))
     }) {
         Ok(body) => (StatusCode::OK, Json(body)),
@@ -748,6 +839,12 @@ mod tests {
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body["position"]["owner"], json!("alice"));
         assert_eq!(body["position"]["collateral_amount"], json!(190));
+
+        let (status, body) = send_empty(&app, Method::GET, "/defi/stats").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["stats"]["position_count"], json!(1));
+        assert_eq!(body["stats"]["total_collateral"], json!(190));
+        assert_eq!(body["stats"]["total_debt"], json!(100));
     }
 
     /// 验证健康仓位清算会被拒绝。
@@ -843,6 +940,62 @@ mod tests {
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body["outcome"]["token"]["owner"], json!("bob"));
         assert_eq!(body["outcome"]["paid_price"], json!(188));
+
+        let (status, body) = send_empty(&app, Method::GET, "/nft/owner/bob/tokens").await;
+        assert_eq!(status, StatusCode::OK);
+        let token_count = body["tokens"].as_array().expect("tokens 应为数组").len();
+        assert_eq!(token_count, 1);
+
+        let (status, body) = send_empty(&app, Method::GET, "/nft/listings/active").await;
+        assert_eq!(status, StatusCode::OK);
+        let active_count = body["listings"]
+            .as_array()
+            .expect("listings 应为数组")
+            .len();
+        assert_eq!(active_count, 0);
+    }
+
+    /// 验证活跃挂单查询会返回未成交挂单。
+    #[tokio::test]
+    async fn nft_active_listing_should_be_queryable() {
+        let app = build_test_app();
+
+        let (status, body) = send_json(
+            &app,
+            Method::POST,
+            "/nft/mint",
+            json!({
+                "owner": "alice",
+                "name": "Forest",
+                "description": "digital art",
+                "image_url": "https://img/2.png"
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let token_id = body["token"]["token_id"]
+            .as_str()
+            .expect("token_id 应存在")
+            .to_string();
+
+        let (status, _) = send_json(
+            &app,
+            Method::POST,
+            "/nft/list",
+            json!({
+                "seller": "alice",
+                "token_id": token_id,
+                "price": 99
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+
+        let (status, body) = send_empty(&app, Method::GET, "/nft/listings/active").await;
+        assert_eq!(status, StatusCode::OK);
+        let listings = body["listings"].as_array().expect("listings 应为数组");
+        assert_eq!(listings.len(), 1);
+        assert_eq!(listings[0]["status"], json!("active"));
     }
 
     /// 验证 NFT 查询不存在资产时返回 404。
