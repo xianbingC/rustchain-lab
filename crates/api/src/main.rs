@@ -5,6 +5,7 @@ use axum::{
     Json, Router,
 };
 use rustchain_apps::defi::{DefiError, LendingConfig, LendingPool};
+use rustchain_apps::nft::{NftError, NftMarketplace};
 use rustchain_common::{logging::init_logging, AppConfig, AppResult};
 use rustchain_core::transaction::Transaction;
 use rustchain_crypto::wallet::create_wallet;
@@ -35,6 +36,7 @@ async fn run() -> AppResult<()> {
             LendingConfig::default(),
             now_unix_ts(),
         ))),
+        nft_marketplace: Arc::new(Mutex::new(NftMarketplace::new())),
     };
 
     let app = Router::new()
@@ -45,6 +47,12 @@ async fn run() -> AppResult<()> {
         .route("/defi/borrow", post(defi_borrow_handler))
         .route("/defi/repay", post(defi_repay_handler))
         .route("/defi/position/:owner", get(defi_position_handler))
+        .route("/nft/mint", post(nft_mint_handler))
+        .route("/nft/list", post(nft_list_handler))
+        .route("/nft/cancel", post(nft_cancel_handler))
+        .route("/nft/buy", post(nft_buy_handler))
+        .route("/nft/token/:token_id", get(nft_token_handler))
+        .route("/nft/listing/:listing_id", get(nft_listing_handler))
         .with_state(shared_state);
     let listen_addr = config.api_listen_addr();
     let listener = TcpListener::bind(&listen_addr).await?;
@@ -133,6 +141,8 @@ async fn wallet_create_handler(
 struct AppState {
     /// DeFi 借贷池（原型阶段使用内存存储）。
     lending_pool: Arc<Mutex<LendingPool>>,
+    /// NFT 市场（原型阶段使用内存存储）。
+    nft_marketplace: Arc<Mutex<NftMarketplace>>,
 }
 
 /// 交易验签接口：检查交易结构、地址公钥匹配和签名有效性。
@@ -326,6 +336,169 @@ async fn defi_position_handler(
     }
 }
 
+/// NFT 铸造请求。
+#[derive(Debug, Deserialize)]
+struct NftMintRequest {
+    /// 初始持有人地址。
+    owner: String,
+    /// NFT 名称。
+    name: String,
+    /// NFT 描述。
+    description: String,
+    /// 图片链接。
+    image_url: String,
+}
+
+/// NFT 挂单请求。
+#[derive(Debug, Deserialize)]
+struct NftListRequest {
+    /// 卖家地址。
+    seller: String,
+    /// NFT 资产 ID。
+    token_id: String,
+    /// 标价。
+    price: u64,
+}
+
+/// NFT 取消挂单请求。
+#[derive(Debug, Deserialize)]
+struct NftCancelRequest {
+    /// 卖家地址。
+    seller: String,
+    /// 挂单 ID。
+    listing_id: String,
+}
+
+/// NFT 购买请求。
+#[derive(Debug, Deserialize)]
+struct NftBuyRequest {
+    /// 买家地址。
+    buyer: String,
+    /// 挂单 ID。
+    listing_id: String,
+}
+
+/// NFT 铸造接口。
+async fn nft_mint_handler(
+    State(state): State<AppState>,
+    Json(payload): Json<NftMintRequest>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    match with_market_mut(&state, |market| {
+        let token = market.mint(
+            &payload.owner,
+            &payload.name,
+            &payload.description,
+            &payload.image_url,
+        )?;
+        Ok(json!({
+            "ok": true,
+            "token": token
+        }))
+    }) {
+        Ok(body) => (StatusCode::OK, Json(body)),
+        Err((status, body)) => (status, Json(body)),
+    }
+}
+
+/// NFT 挂单接口。
+async fn nft_list_handler(
+    State(state): State<AppState>,
+    Json(payload): Json<NftListRequest>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    match with_market_mut(&state, |market| {
+        let listing = market.list(&payload.seller, &payload.token_id, payload.price)?;
+        Ok(json!({
+            "ok": true,
+            "listing": listing
+        }))
+    }) {
+        Ok(body) => (StatusCode::OK, Json(body)),
+        Err((status, body)) => (status, Json(body)),
+    }
+}
+
+/// NFT 取消挂单接口。
+async fn nft_cancel_handler(
+    State(state): State<AppState>,
+    Json(payload): Json<NftCancelRequest>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    match with_market_mut(&state, |market| {
+        let listing = market.cancel_listing(&payload.seller, &payload.listing_id)?;
+        Ok(json!({
+            "ok": true,
+            "listing": listing
+        }))
+    }) {
+        Ok(body) => (StatusCode::OK, Json(body)),
+        Err((status, body)) => (status, Json(body)),
+    }
+}
+
+/// NFT 购买接口。
+async fn nft_buy_handler(
+    State(state): State<AppState>,
+    Json(payload): Json<NftBuyRequest>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    match with_market_mut(&state, |market| {
+        let outcome = market.buy(&payload.buyer, &payload.listing_id)?;
+        Ok(json!({
+            "ok": true,
+            "outcome": outcome
+        }))
+    }) {
+        Ok(body) => (StatusCode::OK, Json(body)),
+        Err((status, body)) => (status, Json(body)),
+    }
+}
+
+/// NFT 查询资产接口。
+async fn nft_token_handler(
+    State(state): State<AppState>,
+    Path(token_id): Path<String>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    match with_market(&state, |market| {
+        let token =
+            market
+                .tokens
+                .get(&token_id)
+                .cloned()
+                .ok_or_else(|| NftError::TokenNotFound {
+                    token_id: token_id.clone(),
+                })?;
+        Ok(json!({
+            "ok": true,
+            "token": token
+        }))
+    }) {
+        Ok(body) => (StatusCode::OK, Json(body)),
+        Err((status, body)) => (status, Json(body)),
+    }
+}
+
+/// NFT 查询挂单接口。
+async fn nft_listing_handler(
+    State(state): State<AppState>,
+    Path(listing_id): Path<String>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    match with_market(&state, |market| {
+        let listing =
+            market
+                .listings
+                .get(&listing_id)
+                .cloned()
+                .ok_or_else(|| NftError::ListingNotFound {
+                    listing_id: listing_id.clone(),
+                })?;
+        Ok(json!({
+            "ok": true,
+            "listing": listing
+        }))
+    }) {
+        Ok(body) => (StatusCode::OK, Json(body)),
+        Err((status, body)) => (status, Json(body)),
+    }
+}
+
 /// 只读访问借贷池。
 fn with_pool<T>(
     state: &AppState,
@@ -362,10 +535,61 @@ fn with_pool_mut<T>(
     f(&mut guard).map_err(map_defi_error)
 }
 
+/// 只读访问 NFT 市场。
+fn with_market<T>(
+    state: &AppState,
+    f: impl FnOnce(&NftMarketplace) -> Result<T, NftError>,
+) -> Result<T, (StatusCode, serde_json::Value)> {
+    let guard = state.nft_marketplace.lock().map_err(|_| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            json!({
+                "ok": false,
+                "error": "nft_marketplace 锁异常"
+            }),
+        )
+    })?;
+
+    f(&guard).map_err(map_nft_error)
+}
+
+/// 可变访问 NFT 市场。
+fn with_market_mut<T>(
+    state: &AppState,
+    f: impl FnOnce(&mut NftMarketplace) -> Result<T, NftError>,
+) -> Result<T, (StatusCode, serde_json::Value)> {
+    let mut guard = state.nft_marketplace.lock().map_err(|_| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            json!({
+                "ok": false,
+                "error": "nft_marketplace 锁异常"
+            }),
+        )
+    })?;
+
+    f(&mut guard).map_err(map_nft_error)
+}
+
 /// DeFi 业务错误映射为 HTTP 错误响应。
 fn map_defi_error(error: DefiError) -> (StatusCode, serde_json::Value) {
     let status = match error {
         DefiError::ArithmeticOverflow => StatusCode::INTERNAL_SERVER_ERROR,
+        _ => StatusCode::BAD_REQUEST,
+    };
+    (
+        status,
+        json!({
+            "ok": false,
+            "error": error.to_string()
+        }),
+    )
+}
+
+/// NFT 业务错误映射为 HTTP 错误响应。
+fn map_nft_error(error: NftError) -> (StatusCode, serde_json::Value) {
+    let status = match error {
+        NftError::TokenNotFound { .. } | NftError::ListingNotFound { .. } => StatusCode::NOT_FOUND,
         _ => StatusCode::BAD_REQUEST,
     };
     (
