@@ -31,29 +31,7 @@ async fn run() -> AppResult<()> {
     let config = AppConfig::from_env("rustchain-api")?;
     init_logging(&config)?;
 
-    let shared_state = AppState {
-        lending_pool: Arc::new(Mutex::new(LendingPool::new(
-            LendingConfig::default(),
-            now_unix_ts(),
-        ))),
-        nft_marketplace: Arc::new(Mutex::new(NftMarketplace::new())),
-    };
-
-    let app = Router::new()
-        .route("/health", get(health_handler))
-        .route("/wallet/create", post(wallet_create_handler))
-        .route("/tx/verify", post(tx_verify_handler))
-        .route("/defi/deposit", post(defi_deposit_handler))
-        .route("/defi/borrow", post(defi_borrow_handler))
-        .route("/defi/repay", post(defi_repay_handler))
-        .route("/defi/position/:owner", get(defi_position_handler))
-        .route("/nft/mint", post(nft_mint_handler))
-        .route("/nft/list", post(nft_list_handler))
-        .route("/nft/cancel", post(nft_cancel_handler))
-        .route("/nft/buy", post(nft_buy_handler))
-        .route("/nft/token/:token_id", get(nft_token_handler))
-        .route("/nft/listing/:listing_id", get(nft_listing_handler))
-        .with_state(shared_state);
+    let app = build_app(default_app_state());
     let listen_addr = config.api_listen_addr();
     let listener = TcpListener::bind(&listen_addr).await?;
 
@@ -145,6 +123,38 @@ struct AppState {
     nft_marketplace: Arc<Mutex<NftMarketplace>>,
 }
 
+/// 构造默认应用状态。
+fn default_app_state() -> AppState {
+    AppState {
+        lending_pool: Arc::new(Mutex::new(LendingPool::new(
+            LendingConfig::default(),
+            now_unix_ts(),
+        ))),
+        nft_marketplace: Arc::new(Mutex::new(NftMarketplace::new())),
+    }
+}
+
+/// 构造 API 路由。
+fn build_app(shared_state: AppState) -> Router {
+    Router::new()
+        .route("/health", get(health_handler))
+        .route("/wallet/create", post(wallet_create_handler))
+        .route("/tx/verify", post(tx_verify_handler))
+        .route("/defi/deposit", post(defi_deposit_handler))
+        .route("/defi/borrow", post(defi_borrow_handler))
+        .route("/defi/repay", post(defi_repay_handler))
+        .route("/defi/withdraw", post(defi_withdraw_handler))
+        .route("/defi/liquidate", post(defi_liquidate_handler))
+        .route("/defi/position/:owner", get(defi_position_handler))
+        .route("/nft/mint", post(nft_mint_handler))
+        .route("/nft/list", post(nft_list_handler))
+        .route("/nft/cancel", post(nft_cancel_handler))
+        .route("/nft/buy", post(nft_buy_handler))
+        .route("/nft/token/:token_id", get(nft_token_handler))
+        .route("/nft/listing/:listing_id", get(nft_listing_handler))
+        .with_state(shared_state)
+}
+
 /// 交易验签接口：检查交易结构、地址公钥匹配和签名有效性。
 async fn tx_verify_handler(
     Json(payload): Json<VerifyTxRequest>,
@@ -174,6 +184,15 @@ struct DefiActionRequest {
     /// 用户地址。
     owner: String,
     /// 操作数量。
+    amount: u64,
+}
+
+/// DeFi 清算请求载荷。
+#[derive(Debug, Deserialize)]
+struct DefiLiquidateRequest {
+    /// 被清算地址。
+    borrower: String,
+    /// 偿还债务数量。
     amount: u64,
 }
 
@@ -288,6 +307,67 @@ async fn defi_repay_handler(
                 "debt_amount": position.debt_amount,
                 "collateral_ratio_bps": position.collateral_ratio_bps
             }
+        }))
+    }) {
+        Ok(body) => (StatusCode::OK, Json(body)),
+        Err((status, body)) => (status, Json(body)),
+    }
+}
+
+/// DeFi 提取抵押接口。
+async fn defi_withdraw_handler(
+    State(state): State<AppState>,
+    Json(payload): Json<DefiActionRequest>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    if payload.owner.trim().is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "ok": false,
+                "error": "owner 不能为空"
+            })),
+        );
+    }
+
+    let now_ts = now_unix_ts();
+    match with_pool_mut(&state, |pool| {
+        let position = pool.withdraw_collateral(&payload.owner, payload.amount, now_ts)?;
+        Ok(json!({
+            "ok": true,
+            "position": {
+                "owner": position.owner,
+                "collateral_amount": position.collateral_amount,
+                "debt_amount": position.debt_amount,
+                "collateral_ratio_bps": position.collateral_ratio_bps
+            }
+        }))
+    }) {
+        Ok(body) => (StatusCode::OK, Json(body)),
+        Err((status, body)) => (status, Json(body)),
+    }
+}
+
+/// DeFi 清算接口。
+async fn defi_liquidate_handler(
+    State(state): State<AppState>,
+    Json(payload): Json<DefiLiquidateRequest>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    if payload.borrower.trim().is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "ok": false,
+                "error": "borrower 不能为空"
+            })),
+        );
+    }
+
+    let now_ts = now_unix_ts();
+    match with_pool_mut(&state, |pool| {
+        let outcome = pool.liquidate(&payload.borrower, payload.amount, now_ts)?;
+        Ok(json!({
+            "ok": true,
+            "outcome": outcome
         }))
     }) {
         Ok(body) => (StatusCode::OK, Json(body)),
@@ -607,4 +687,213 @@ fn now_unix_ts() -> i64 {
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_secs() as i64)
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{build_app, default_app_state};
+    use axum::{
+        body::{to_bytes, Body},
+        http::{Method, Request, StatusCode},
+        Router,
+    };
+    use serde_json::{json, Value};
+    use tower::ServiceExt;
+
+    /// 验证 DeFi 抵押、借款和仓位查询主流程。
+    #[tokio::test]
+    async fn defi_flow_should_work() {
+        let app = build_test_app();
+
+        let (status, _) = send_json(
+            &app,
+            Method::POST,
+            "/defi/deposit",
+            json!({
+                "owner": "alice",
+                "amount": 200
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+
+        let (status, body) = send_json(
+            &app,
+            Method::POST,
+            "/defi/borrow",
+            json!({
+                "owner": "alice",
+                "amount": 100
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["ok"], json!(true));
+        assert_eq!(body["position"]["debt_amount"], json!(100));
+
+        let (status, body) = send_json(
+            &app,
+            Method::POST,
+            "/defi/withdraw",
+            json!({
+                "owner": "alice",
+                "amount": 10
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["position"]["collateral_amount"], json!(190));
+
+        let (status, body) = send_empty(&app, Method::GET, "/defi/position/alice").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["position"]["owner"], json!("alice"));
+        assert_eq!(body["position"]["collateral_amount"], json!(190));
+    }
+
+    /// 验证健康仓位清算会被拒绝。
+    #[tokio::test]
+    async fn defi_healthy_position_should_not_liquidate() {
+        let app = build_test_app();
+
+        let _ = send_json(
+            &app,
+            Method::POST,
+            "/defi/deposit",
+            json!({
+                "owner": "alice",
+                "amount": 200
+            }),
+        )
+        .await;
+        let _ = send_json(
+            &app,
+            Method::POST,
+            "/defi/borrow",
+            json!({
+                "owner": "alice",
+                "amount": 100
+            }),
+        )
+        .await;
+
+        let (status, body) = send_json(
+            &app,
+            Method::POST,
+            "/defi/liquidate",
+            json!({
+                "borrower": "alice",
+                "amount": 20
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["ok"], json!(false));
+    }
+
+    /// 验证 NFT 铸造、挂单、购买主流程。
+    #[tokio::test]
+    async fn nft_flow_should_work() {
+        let app = build_test_app();
+
+        let (status, body) = send_json(
+            &app,
+            Method::POST,
+            "/nft/mint",
+            json!({
+                "owner": "alice",
+                "name": "Sunset",
+                "description": "digital art",
+                "image_url": "https://img/1.png"
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let token_id = body["token"]["token_id"]
+            .as_str()
+            .expect("token_id 应存在")
+            .to_string();
+
+        let (status, body) = send_json(
+            &app,
+            Method::POST,
+            "/nft/list",
+            json!({
+                "seller": "alice",
+                "token_id": token_id,
+                "price": 188
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let listing_id = body["listing"]["listing_id"]
+            .as_str()
+            .expect("listing_id 应存在")
+            .to_string();
+
+        let (status, body) = send_json(
+            &app,
+            Method::POST,
+            "/nft/buy",
+            json!({
+                "buyer": "bob",
+                "listing_id": listing_id
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["outcome"]["token"]["owner"], json!("bob"));
+        assert_eq!(body["outcome"]["paid_price"], json!(188));
+    }
+
+    /// 验证 NFT 查询不存在资产时返回 404。
+    #[tokio::test]
+    async fn nft_missing_token_should_return_not_found() {
+        let app = build_test_app();
+
+        let (status, body) = send_empty(&app, Method::GET, "/nft/token/not-exist").await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(body["ok"], json!(false));
+    }
+
+    /// 创建测试用路由。
+    fn build_test_app() -> Router {
+        build_app(default_app_state())
+    }
+
+    /// 发送 JSON 请求。
+    async fn send_json(
+        app: &Router,
+        method: Method,
+        uri: &str,
+        payload: Value,
+    ) -> (StatusCode, Value) {
+        let request = Request::builder()
+            .method(method)
+            .uri(uri)
+            .header("content-type", "application/json")
+            .body(Body::from(payload.to_string()))
+            .expect("请求构造应成功");
+        send_request(app, request).await
+    }
+
+    /// 发送空载荷请求。
+    async fn send_empty(app: &Router, method: Method, uri: &str) -> (StatusCode, Value) {
+        let request = Request::builder()
+            .method(method)
+            .uri(uri)
+            .body(Body::empty())
+            .expect("请求构造应成功");
+        send_request(app, request).await
+    }
+
+    /// 发送请求并解析 JSON 响应。
+    async fn send_request(app: &Router, request: Request<Body>) -> (StatusCode, Value) {
+        let response = app.clone().oneshot(request).await.expect("请求处理应成功");
+        let status = response.status();
+        let bytes = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("读取响应体应成功");
+        let body = serde_json::from_slice(&bytes).expect("响应应为 JSON");
+        (status, body)
+    }
 }
