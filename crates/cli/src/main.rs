@@ -39,6 +39,7 @@ fn dispatch_command(config: &AppConfig, args: &[String]) -> AppResult<()> {
     match args[0].as_str() {
         "wallet" => handle_wallet_command(args),
         "tx" => handle_tx_command(args),
+        "chain" => handle_chain_command(config, args),
         "defi" => handle_defi_command(config, args),
         "nft" => handle_nft_command(config, args),
         "help" | "--help" | "-h" => {
@@ -147,6 +148,59 @@ fn run_sign_demo(args: &[String]) -> AppResult<()> {
             "validated": true
         }),
     )
+}
+
+/// 处理链核心相关命令（通过 API 调用）。
+fn handle_chain_command(config: &AppConfig, args: &[String]) -> AppResult<()> {
+    if args.len() < 2 {
+        return Err(AppError::Command(
+            "chain 命令缺少子命令，可用: info/balance/mine/transfer".to_string(),
+        ));
+    }
+
+    match args[1].as_str() {
+        "info" => {
+            let response = call_api_json(config, Method::GET, "/chain/info", None)?;
+            print_json("chain_info", response)
+        }
+        "balance" => {
+            let address = require_arg(args, 2, "address")?;
+            let path = format!("/chain/balance/{address}");
+            let response = call_api_json(config, Method::GET, &path, None)?;
+            print_json("chain_balance", response)
+        }
+        "mine" => {
+            let miner_address = require_arg(args, 2, "miner_address")?;
+            let response = call_api_json(
+                config,
+                Method::POST,
+                "/chain/mine",
+                Some(json!({ "miner_address": miner_address })),
+            )?;
+            print_json("chain_mine", response)
+        }
+        "transfer" => {
+            let from = require_arg(args, 2, "from")?;
+            let to = require_arg(args, 3, "to")?;
+            let amount = parse_u64_arg(args, 4, "amount")?;
+            let private_key = require_arg(args, 5, "private_key")?;
+            let public_key = require_arg(args, 6, "public_key")?;
+            let payload = args
+                .get(7)
+                .map(|text| text.as_bytes().to_vec())
+                .or_else(|| Some(b"cli-chain-transfer".to_vec()));
+
+            let tx = build_signed_transfer_tx(from, to, amount, private_key, public_key, payload)?;
+            let response = call_api_json(
+                config,
+                Method::POST,
+                "/chain/tx",
+                Some(json!({ "transaction": tx })),
+            )?;
+            print_json("chain_transfer_submit", response)
+        }
+        other => Err(AppError::Command(format!("未知 chain 子命令: {other}"))),
+    }
 }
 
 /// 处理 DeFi 相关命令（通过 API 调用）。
@@ -397,12 +451,39 @@ fn parse_u64_arg(args: &[String], index: usize, name: &str) -> AppResult<u64> {
         .map_err(|error| AppError::Command(format!("{name} 参数解析失败: {error}")))
 }
 
+/// 构造并签名一笔转账交易，用于提交到链接口。
+fn build_signed_transfer_tx(
+    from: &str,
+    to: &str,
+    amount: u64,
+    private_key: &str,
+    public_key: &str,
+    payload: Option<Vec<u8>>,
+) -> AppResult<Transaction> {
+    if amount == 0 {
+        return Err(AppError::Command("amount 必须大于 0".to_string()));
+    }
+
+    let mut tx = Transaction::new(from.to_string(), to.to_string(), amount, payload);
+    tx.sign_with_private_key(private_key, public_key)
+        .map_err(|error| AppError::Command(format!("交易签名失败: {error}")))?;
+    tx.validate_for_chain()
+        .map_err(|error| AppError::Command(format!("交易校验失败: {error}")))?;
+    Ok(tx)
+}
+
 /// 打印帮助信息。
 fn print_help() {
     println!("RustChain Lab CLI");
     println!("用法:");
     println!("  rustchain-cli wallet create <password>");
     println!("  rustchain-cli tx sign-demo [amount]");
+    println!("  rustchain-cli chain info");
+    println!("  rustchain-cli chain balance <address>");
+    println!("  rustchain-cli chain mine <miner_address>");
+    println!(
+        "  rustchain-cli chain transfer <from> <to> <amount> <private_key> <public_key> [payload]"
+    );
     println!("  rustchain-cli defi deposit <owner> <amount>");
     println!("  rustchain-cli defi borrow <owner> <amount>");
     println!("  rustchain-cli defi repay <owner> <amount>");
@@ -423,8 +504,9 @@ fn print_help() {
 
 #[cfg(test)]
 mod tests {
-    use super::api_base_url;
+    use super::{api_base_url, build_signed_transfer_tx};
     use rustchain_common::AppConfig;
+    use rustchain_crypto::wallet::create_wallet;
 
     /// 验证 API 根地址组装正确。
     #[test]
@@ -442,5 +524,47 @@ mod tests {
         };
 
         assert_eq!(api_base_url(&config), "http://127.0.0.1:8088");
+    }
+
+    /// 验证可以构造并签名合法转账交易。
+    #[test]
+    fn build_signed_transfer_tx_should_work() {
+        let (sender_wallet, sender_key_pair) =
+            create_wallet("sender-pass").expect("钱包创建应成功");
+        let (receiver_wallet, _) = create_wallet("receiver-pass").expect("钱包创建应成功");
+
+        let tx = build_signed_transfer_tx(
+            &sender_wallet.address,
+            &receiver_wallet.address,
+            10,
+            &sender_key_pair.private_key,
+            &sender_key_pair.public_key,
+            Some(b"unit-test".to_vec()),
+        )
+        .expect("交易构造应成功");
+
+        assert_eq!(tx.from, sender_wallet.address);
+        assert_eq!(tx.to, receiver_wallet.address);
+        assert_eq!(tx.amount, 10);
+        assert!(tx.signature.is_some());
+    }
+
+    /// 验证金额为 0 的转账会被拒绝。
+    #[test]
+    fn build_signed_transfer_tx_with_zero_amount_should_fail() {
+        let (sender_wallet, sender_key_pair) =
+            create_wallet("sender-pass").expect("钱包创建应成功");
+        let (receiver_wallet, _) = create_wallet("receiver-pass").expect("钱包创建应成功");
+
+        let result = build_signed_transfer_tx(
+            &sender_wallet.address,
+            &receiver_wallet.address,
+            0,
+            &sender_key_pair.private_key,
+            &sender_key_pair.public_key,
+            None,
+        );
+
+        assert!(result.is_err());
     }
 }
