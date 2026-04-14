@@ -7,6 +7,7 @@ use axum::{
 use rustchain_apps::defi::{DefiError, LendingConfig, LendingPool};
 use rustchain_apps::nft::{NftError, NftMarketplace};
 use rustchain_common::{logging::init_logging, AppConfig, AppResult};
+use rustchain_core::blockchain::Blockchain;
 use rustchain_core::transaction::Transaction;
 use rustchain_crypto::wallet::create_wallet;
 use serde::{Deserialize, Serialize};
@@ -31,7 +32,7 @@ async fn run() -> AppResult<()> {
     let config = AppConfig::from_env("rustchain-api")?;
     init_logging(&config)?;
 
-    let app = build_app(default_app_state());
+    let app = build_app(default_app_state_with_config(&config));
     let listen_addr = config.api_listen_addr();
     let listener = TcpListener::bind(&listen_addr).await?;
 
@@ -69,6 +70,37 @@ struct CreateWalletRequest {
 struct VerifyTxRequest {
     /// 待校验交易。
     transaction: Transaction,
+}
+
+/// 提交链交易请求。
+#[derive(Debug, Deserialize)]
+struct ChainSubmitTxRequest {
+    /// 待提交交易。
+    transaction: Transaction,
+}
+
+/// 挖矿请求。
+#[derive(Debug, Deserialize)]
+struct ChainMineRequest {
+    /// 矿工地址。
+    miner_address: String,
+}
+
+/// 链信息响应。
+#[derive(Debug, Serialize)]
+struct ChainInfoResponse {
+    /// 链标识。
+    chain_id: String,
+    /// 当前链高度。
+    height: u64,
+    /// 最新区块哈希。
+    latest_hash: String,
+    /// 当前难度。
+    difficulty: u32,
+    /// 交易池数量。
+    pending_tx_count: usize,
+    /// 已连接节点数量。
+    peer_count: usize,
 }
 
 /// 创建钱包接口（原型阶段同时返回密钥对用于学习调试）。
@@ -117,6 +149,8 @@ async fn wallet_create_handler(
 /// API 进程内共享状态。
 #[derive(Clone)]
 struct AppState {
+    /// 区块链状态（原型阶段使用内存存储）。
+    blockchain: Arc<Mutex<Blockchain>>,
     /// DeFi 借贷池（原型阶段使用内存存储）。
     lending_pool: Arc<Mutex<LendingPool>>,
     /// NFT 市场（原型阶段使用内存存储）。
@@ -124,8 +158,25 @@ struct AppState {
 }
 
 /// 构造默认应用状态。
+#[cfg(test)]
 fn default_app_state() -> AppState {
     AppState {
+        blockchain: Arc::new(Mutex::new(Blockchain::new(2, 50))),
+        lending_pool: Arc::new(Mutex::new(LendingPool::new(
+            LendingConfig::default(),
+            now_unix_ts(),
+        ))),
+        nft_marketplace: Arc::new(Mutex::new(NftMarketplace::new())),
+    }
+}
+
+/// 根据配置构造应用状态。
+fn default_app_state_with_config(config: &AppConfig) -> AppState {
+    AppState {
+        blockchain: Arc::new(Mutex::new(Blockchain::new(
+            config.mining_difficulty,
+            config.mining_reward,
+        ))),
         lending_pool: Arc::new(Mutex::new(LendingPool::new(
             LendingConfig::default(),
             now_unix_ts(),
@@ -140,6 +191,10 @@ fn build_app(shared_state: AppState) -> Router {
         .route("/health", get(health_handler))
         .route("/wallet/create", post(wallet_create_handler))
         .route("/tx/verify", post(tx_verify_handler))
+        .route("/chain/info", get(chain_info_handler))
+        .route("/chain/balance/:address", get(chain_balance_handler))
+        .route("/chain/tx", post(chain_submit_tx_handler))
+        .route("/chain/mine", post(chain_mine_handler))
         .route("/defi/deposit", post(defi_deposit_handler))
         .route("/defi/borrow", post(defi_borrow_handler))
         .route("/defi/repay", post(defi_repay_handler))
@@ -178,6 +233,109 @@ async fn tx_verify_handler(
                 "error": error.to_string()
             })),
         ),
+    }
+}
+
+/// 链信息查询接口。
+async fn chain_info_handler(
+    State(state): State<AppState>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    match with_chain(&state, |chain| {
+        let latest = chain.latest_block()?;
+        let info = ChainInfoResponse {
+            chain_id: chain.chain_id.clone(),
+            height: latest.index,
+            latest_hash: latest.hash.clone(),
+            difficulty: chain.difficulty,
+            pending_tx_count: chain.pending_transactions.len(),
+            peer_count: chain.peers.len(),
+        };
+        Ok(json!({
+            "ok": true,
+            "chain": info
+        }))
+    }) {
+        Ok(body) => (StatusCode::OK, Json(body)),
+        Err((status, body)) => (status, Json(body)),
+    }
+}
+
+/// 链上余额查询接口。
+async fn chain_balance_handler(
+    State(state): State<AppState>,
+    Path(address): Path<String>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    if address.trim().is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "ok": false,
+                "error": "address 不能为空"
+            })),
+        );
+    }
+
+    match with_chain(&state, |chain| {
+        let balance = chain.balances().get(&address).copied().unwrap_or(0);
+        Ok(json!({
+            "ok": true,
+            "address": address,
+            "balance": balance
+        }))
+    }) {
+        Ok(body) => (StatusCode::OK, Json(body)),
+        Err((status, body)) => (status, Json(body)),
+    }
+}
+
+/// 链交易提交接口。
+async fn chain_submit_tx_handler(
+    State(state): State<AppState>,
+    Json(payload): Json<ChainSubmitTxRequest>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    match with_chain_mut(&state, |chain| {
+        chain.add_transaction(payload.transaction.clone())?;
+        Ok(json!({
+            "ok": true,
+            "pending_tx_count": chain.pending_transactions.len()
+        }))
+    }) {
+        Ok(body) => (StatusCode::OK, Json(body)),
+        Err((status, body)) => (status, Json(body)),
+    }
+}
+
+/// 手动挖矿接口。
+async fn chain_mine_handler(
+    State(state): State<AppState>,
+    Json(payload): Json<ChainMineRequest>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    if payload.miner_address.trim().is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "ok": false,
+                "error": "miner_address 不能为空"
+            })),
+        );
+    }
+
+    match with_chain_mut(&state, |chain| {
+        let block = chain.mine_pending_transactions(&payload.miner_address)?;
+        Ok(json!({
+            "ok": true,
+            "block": {
+                "index": block.index,
+                "hash": block.hash,
+                "previous_hash": block.previous_hash,
+                "tx_count": block.transactions.len(),
+                "difficulty": block.difficulty,
+                "nonce": block.nonce
+            }
+        }))
+    }) {
+        Ok(body) => (StatusCode::OK, Json(body)),
+        Err((status, body)) => (status, Json(body)),
     }
 }
 
@@ -670,6 +828,42 @@ async fn nft_owner_tokens_handler(
     }
 }
 
+/// 只读访问区块链状态。
+fn with_chain<T>(
+    state: &AppState,
+    f: impl FnOnce(&Blockchain) -> Result<T, rustchain_core::error::CoreError>,
+) -> Result<T, (StatusCode, serde_json::Value)> {
+    let guard = state.blockchain.lock().map_err(|_| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            json!({
+                "ok": false,
+                "error": "blockchain 锁异常"
+            }),
+        )
+    })?;
+
+    f(&guard).map_err(map_core_error)
+}
+
+/// 可变访问区块链状态。
+fn with_chain_mut<T>(
+    state: &AppState,
+    f: impl FnOnce(&mut Blockchain) -> Result<T, rustchain_core::error::CoreError>,
+) -> Result<T, (StatusCode, serde_json::Value)> {
+    let mut guard = state.blockchain.lock().map_err(|_| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            json!({
+                "ok": false,
+                "error": "blockchain 锁异常"
+            }),
+        )
+    })?;
+
+    f(&mut guard).map_err(map_core_error)
+}
+
 /// 只读访问借贷池。
 fn with_pool<T>(
     state: &AppState,
@@ -772,6 +966,30 @@ fn map_nft_error(error: NftError) -> (StatusCode, serde_json::Value) {
     )
 }
 
+/// 核心链错误映射为 HTTP 错误响应。
+fn map_core_error(error: rustchain_core::error::CoreError) -> (StatusCode, serde_json::Value) {
+    let status = match error {
+        rustchain_core::error::CoreError::EmptyChain
+        | rustchain_core::error::CoreError::InvalidGenesisBlock
+        | rustchain_core::error::CoreError::InvalidBlockHash { .. }
+        | rustchain_core::error::CoreError::InvalidPreviousHash { .. }
+        | rustchain_core::error::CoreError::InvalidMerkleRoot { .. }
+        | rustchain_core::error::CoreError::InvalidProofOfWork { .. }
+        | rustchain_core::error::CoreError::InvalidBlockDifficulty { .. }
+        | rustchain_core::error::CoreError::InvalidBlockIndex { .. } => {
+            StatusCode::INTERNAL_SERVER_ERROR
+        }
+        _ => StatusCode::BAD_REQUEST,
+    };
+    (
+        status,
+        json!({
+            "ok": false,
+            "error": error.to_string()
+        }),
+    )
+}
+
 /// 获取当前 Unix 秒级时间戳。
 fn now_unix_ts() -> i64 {
     SystemTime::now()
@@ -788,8 +1006,77 @@ mod tests {
         http::{Method, Request, StatusCode},
         Router,
     };
+    use rustchain_core::transaction::Transaction;
+    use rustchain_crypto::wallet::create_wallet;
     use serde_json::{json, Value};
     use tower::ServiceExt;
+
+    /// 验证链信息、交易提交、挖矿和余额查询主流程。
+    #[tokio::test]
+    async fn chain_flow_should_work() {
+        let app = build_test_app();
+        let (alice_wallet, alice_key_pair) = create_wallet("alice-pass").expect("创建钱包应成功");
+        let (bob_wallet, _) = create_wallet("bob-pass").expect("创建钱包应成功");
+
+        let (status, body) = send_empty(&app, Method::GET, "/chain/info").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["chain"]["height"], json!(0));
+
+        let (status, _) = send_json(
+            &app,
+            Method::POST,
+            "/chain/mine",
+            json!({ "miner_address": alice_wallet.address.clone() }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+
+        let mut tx = Transaction::new(
+            alice_wallet.address.clone(),
+            bob_wallet.address.clone(),
+            20,
+            Some(b"api-chain-flow".to_vec()),
+        );
+        tx.sign_with_private_key(&alice_key_pair.private_key, &alice_key_pair.public_key)
+            .expect("签名应成功");
+
+        let (status, body) = send_json(
+            &app,
+            Method::POST,
+            "/chain/tx",
+            json!({ "transaction": tx }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["pending_tx_count"], json!(1));
+
+        let (status, _) = send_json(
+            &app,
+            Method::POST,
+            "/chain/mine",
+            json!({ "miner_address": "miner-2" }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+
+        let (status, body) = send_empty(
+            &app,
+            Method::GET,
+            &format!("/chain/balance/{}", alice_wallet.address),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["balance"], json!(30));
+
+        let (status, body) = send_empty(
+            &app,
+            Method::GET,
+            &format!("/chain/balance/{}", bob_wallet.address),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["balance"], json!(20));
+    }
 
     /// 验证 DeFi 抵押、借款和仓位查询主流程。
     #[tokio::test]
