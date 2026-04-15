@@ -11,6 +11,8 @@ rustchain-common = { path = "../common" }
 rustchain-core = { path = "../core" }
 rustchain-crypto = { path = "../crypto" }
 rustchain-apps = { path = "../apps" }
+rustchain-storage = { path = "../storage" }
+bincode.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true

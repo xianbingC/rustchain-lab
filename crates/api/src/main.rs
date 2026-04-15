@@ -7,12 +7,18 @@ use axum::{
 use rustchain_apps::defi::{DefiError, LendingConfig, LendingPool};
 use rustchain_apps::nft::{NftError, NftMarketplace};
 use rustchain_common::{logging::init_logging, AppConfig, AppResult};
+use rustchain_core::block::Block;
 use rustchain_core::blockchain::Blockchain;
 use rustchain_core::transaction::Transaction;
 use rustchain_crypto::wallet::create_wallet;
+use rustchain_storage::{
+    error::StorageError,
+    history::{HistoryStore, LevelDbHistoryStore},
+};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::{
+    path::PathBuf,
     sync::{Arc, Mutex},
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -32,7 +38,7 @@ async fn run() -> AppResult<()> {
     let config = AppConfig::from_env("rustchain-api")?;
     init_logging(&config)?;
 
-    let app = build_app(default_app_state_with_config(&config));
+    let app = build_app(default_app_state_with_config(&config)?);
     let listen_addr = config.api_listen_addr();
     let listener = TcpListener::bind(&listen_addr).await?;
 
@@ -151,6 +157,8 @@ async fn wallet_create_handler(
 struct AppState {
     /// 区块链状态（原型阶段使用内存存储）。
     blockchain: Arc<Mutex<Blockchain>>,
+    /// 历史数据存储。
+    history_store: Arc<dyn HistoryStore + Send + Sync>,
     /// DeFi 借贷池（原型阶段使用内存存储）。
     lending_pool: Arc<Mutex<LendingPool>>,
     /// NFT 市场（原型阶段使用内存存储）。
@@ -162,6 +170,7 @@ struct AppState {
 fn default_app_state() -> AppState {
     AppState {
         blockchain: Arc::new(Mutex::new(Blockchain::new(2, 50))),
+        history_store: Arc::new(rustchain_storage::history::InMemoryHistoryStore::new()),
         lending_pool: Arc::new(Mutex::new(LendingPool::new(
             LendingConfig::default(),
             now_unix_ts(),
@@ -171,18 +180,32 @@ fn default_app_state() -> AppState {
 }
 
 /// 根据配置构造应用状态。
-fn default_app_state_with_config(config: &AppConfig) -> AppState {
-    AppState {
+fn default_app_state_with_config(config: &AppConfig) -> AppResult<AppState> {
+    let history_store = open_history_store(config)?;
+    Ok(AppState {
         blockchain: Arc::new(Mutex::new(Blockchain::new(
             config.mining_difficulty,
             config.mining_reward,
         ))),
+        history_store,
         lending_pool: Arc::new(Mutex::new(LendingPool::new(
             LendingConfig::default(),
             now_unix_ts(),
         ))),
         nft_marketplace: Arc::new(Mutex::new(NftMarketplace::new())),
-    }
+    })
+}
+
+/// 打开历史存储（LevelDB）。
+fn open_history_store(config: &AppConfig) -> AppResult<Arc<dyn HistoryStore + Send + Sync>> {
+    let path = PathBuf::from(&config.data_dir).join("history-leveldb");
+    let store = LevelDbHistoryStore::open(&path).map_err(|error| {
+        rustchain_common::AppError::Command(format!(
+            "打开历史存储失败: path={}, error={error}",
+            path.display()
+        ))
+    })?;
+    Ok(Arc::new(store))
 }
 
 /// 构造 API 路由。
@@ -195,6 +218,8 @@ fn build_app(shared_state: AppState) -> Router {
         .route("/chain/balance/:address", get(chain_balance_handler))
         .route("/chain/tx", post(chain_submit_tx_handler))
         .route("/chain/mine", post(chain_mine_handler))
+        .route("/history/block/:block_hash", get(history_block_handler))
+        .route("/history/tx/:tx_id", get(history_tx_handler))
         .route("/defi/deposit", post(defi_deposit_handler))
         .route("/defi/borrow", post(defi_borrow_handler))
         .route("/defi/repay", post(defi_repay_handler))
@@ -320,21 +345,122 @@ async fn chain_mine_handler(
         );
     }
 
+    let history_store = state.history_store.clone();
     match with_chain_mut(&state, |chain| {
-        let block = chain.mine_pending_transactions(&payload.miner_address)?;
-        Ok(json!({
-            "ok": true,
-            "block": {
-                "index": block.index,
-                "hash": block.hash,
-                "previous_hash": block.previous_hash,
-                "tx_count": block.transactions.len(),
-                "difficulty": block.difficulty,
-                "nonce": block.nonce
-            }
-        }))
+        chain.mine_pending_transactions(&payload.miner_address)
     }) {
-        Ok(body) => (StatusCode::OK, Json(body)),
+        Ok(block) => {
+            if let Err(error) = persist_mined_block(history_store.as_ref(), &block) {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({
+                        "ok": false,
+                        "error": format!("持久化历史数据失败: {error}")
+                    })),
+                );
+            }
+
+            (
+                StatusCode::OK,
+                Json(json!({
+                    "ok": true,
+                    "block": {
+                        "index": block.index,
+                        "hash": block.hash,
+                        "previous_hash": block.previous_hash,
+                        "tx_count": block.transactions.len(),
+                        "difficulty": block.difficulty,
+                        "nonce": block.nonce
+                    }
+                })),
+            )
+        }
+        Err((status, body)) => (status, Json(body)),
+    }
+}
+
+/// 历史区块查询接口。
+async fn history_block_handler(
+    State(state): State<AppState>,
+    Path(block_hash): Path<String>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    if block_hash.trim().is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "ok": false,
+                "error": "block_hash 不能为空"
+            })),
+        );
+    }
+
+    match with_history(&state, |history| history.get_block(&block_hash)) {
+        Ok(Some(raw)) => match bincode::deserialize::<Block>(&raw) {
+            Ok(block) => (
+                StatusCode::OK,
+                Json(json!({
+                    "ok": true,
+                    "block": block
+                })),
+            ),
+            Err(error) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({
+                    "ok": false,
+                    "error": format!("历史区块反序列化失败: {error}")
+                })),
+            ),
+        },
+        Ok(None) => (
+            StatusCode::NOT_FOUND,
+            Json(json!({
+                "ok": false,
+                "error": format!("区块不存在: {block_hash}")
+            })),
+        ),
+        Err((status, body)) => (status, Json(body)),
+    }
+}
+
+/// 历史交易查询接口。
+async fn history_tx_handler(
+    State(state): State<AppState>,
+    Path(tx_id): Path<String>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    if tx_id.trim().is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "ok": false,
+                "error": "tx_id 不能为空"
+            })),
+        );
+    }
+
+    match with_history(&state, |history| history.get_transaction(&tx_id)) {
+        Ok(Some(raw)) => match bincode::deserialize::<Transaction>(&raw) {
+            Ok(transaction) => (
+                StatusCode::OK,
+                Json(json!({
+                    "ok": true,
+                    "transaction": transaction
+                })),
+            ),
+            Err(error) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({
+                    "ok": false,
+                    "error": format!("历史交易反序列化失败: {error}")
+                })),
+            ),
+        },
+        Ok(None) => (
+            StatusCode::NOT_FOUND,
+            Json(json!({
+                "ok": false,
+                "error": format!("交易不存在: {tx_id}")
+            })),
+        ),
         Err((status, body)) => (status, Json(body)),
     }
 }
@@ -936,6 +1062,29 @@ fn with_market_mut<T>(
     f(&mut guard).map_err(map_nft_error)
 }
 
+/// 访问历史存储。
+fn with_history<T>(
+    state: &AppState,
+    f: impl FnOnce(&dyn HistoryStore) -> Result<T, StorageError>,
+) -> Result<T, (StatusCode, serde_json::Value)> {
+    f(state.history_store.as_ref()).map_err(map_storage_error)
+}
+
+/// 持久化新挖出的区块及其交易历史。
+fn persist_mined_block(history: &dyn HistoryStore, block: &Block) -> Result<(), StorageError> {
+    let block_bytes =
+        bincode::serialize(block).map_err(|error| StorageError::Codec(error.to_string()))?;
+    history.put_block(&block.hash, &block_bytes)?;
+
+    for tx in &block.transactions {
+        let tx_bytes =
+            bincode::serialize(tx).map_err(|error| StorageError::Codec(error.to_string()))?;
+        history.put_transaction(&tx.id, &tx_bytes)?;
+    }
+
+    Ok(())
+}
+
 /// DeFi 业务错误映射为 HTTP 错误响应。
 fn map_defi_error(error: DefiError) -> (StatusCode, serde_json::Value) {
     let status = match error {
@@ -983,6 +1132,17 @@ fn map_core_error(error: rustchain_core::error::CoreError) -> (StatusCode, serde
     };
     (
         status,
+        json!({
+            "ok": false,
+            "error": error.to_string()
+        }),
+    )
+}
+
+/// 存储错误映射为 HTTP 错误响应。
+fn map_storage_error(error: StorageError) -> (StatusCode, serde_json::Value) {
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
         json!({
             "ok": false,
             "error": error.to_string()
@@ -1039,6 +1199,7 @@ mod tests {
         );
         tx.sign_with_private_key(&alice_key_pair.private_key, &alice_key_pair.public_key)
             .expect("签名应成功");
+        let tx_id = tx.id.clone();
 
         let (status, body) = send_json(
             &app,
@@ -1050,7 +1211,7 @@ mod tests {
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body["pending_tx_count"], json!(1));
 
-        let (status, _) = send_json(
+        let (status, body) = send_json(
             &app,
             Method::POST,
             "/chain/mine",
@@ -1058,6 +1219,19 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::OK);
+        let block_hash = body["block"]["hash"]
+            .as_str()
+            .expect("block.hash 应存在")
+            .to_string();
+
+        let (status, body) =
+            send_empty(&app, Method::GET, &format!("/history/block/{block_hash}")).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["block"]["hash"], json!(block_hash));
+
+        let (status, body) = send_empty(&app, Method::GET, &format!("/history/tx/{tx_id}")).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["transaction"]["id"], json!(tx_id));
 
         let (status, body) = send_empty(
             &app,
@@ -1291,6 +1465,16 @@ mod tests {
         let app = build_test_app();
 
         let (status, body) = send_empty(&app, Method::GET, "/nft/token/not-exist").await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(body["ok"], json!(false));
+    }
+
+    /// 验证查询不存在的历史交易返回 404。
+    #[tokio::test]
+    async fn history_missing_tx_should_return_not_found() {
+        let app = build_test_app();
+        let (status, body) = send_empty(&app, Method::GET, "/history/tx/not-exist").await;
+
         assert_eq!(status, StatusCode::NOT_FOUND);
         assert_eq!(body["ok"], json!(false));
     }
