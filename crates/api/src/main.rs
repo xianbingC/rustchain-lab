@@ -236,6 +236,14 @@ fn build_app(shared_state: AppState) -> Router {
         .route("/tx/verify", post(tx_verify_handler))
         .route("/chain/info", get(chain_info_handler))
         .route("/chain/balance/:address", get(chain_balance_handler))
+        .route(
+            "/chain/contract/:address/state",
+            get(chain_contract_state_handler),
+        )
+        .route(
+            "/chain/contract/:address/events",
+            get(chain_contract_events_handler),
+        )
         .route("/chain/tx", post(chain_submit_tx_handler))
         .route("/chain/mine", post(chain_mine_handler))
         .route("/history/block/:block_hash", get(history_block_handler))
@@ -328,6 +336,62 @@ async fn chain_balance_handler(
             "ok": true,
             "address": address,
             "balance": balance
+        }))
+    }) {
+        Ok(body) => (StatusCode::OK, Json(body)),
+        Err((status, body)) => (status, Json(body)),
+    }
+}
+
+/// 合约状态查询接口。
+async fn chain_contract_state_handler(
+    State(state): State<AppState>,
+    Path(address): Path<String>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    if address.trim().is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "ok": false,
+                "error": "address 不能为空"
+            })),
+        );
+    }
+
+    match with_chain(&state, |chain| {
+        let state_snapshot = chain.contract_state_snapshot(&address);
+        Ok(json!({
+            "ok": true,
+            "address": address,
+            "state": state_snapshot.unwrap_or_default()
+        }))
+    }) {
+        Ok(body) => (StatusCode::OK, Json(body)),
+        Err((status, body)) => (status, Json(body)),
+    }
+}
+
+/// 合约事件查询接口。
+async fn chain_contract_events_handler(
+    State(state): State<AppState>,
+    Path(address): Path<String>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    if address.trim().is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "ok": false,
+                "error": "address 不能为空"
+            })),
+        );
+    }
+
+    match with_chain(&state, |chain| {
+        let events = chain.contract_events_snapshot(&address);
+        Ok(json!({
+            "ok": true,
+            "address": address,
+            "events": events
         }))
     }) {
         Ok(body) => (StatusCode::OK, Json(body)),
@@ -1643,6 +1707,69 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert_eq!(body["ok"], json!(false));
+    }
+
+    /// 验证合约交易出块后可查询到状态和事件。
+    #[tokio::test]
+    async fn chain_contract_state_and_events_should_be_queryable() {
+        let app = build_test_app();
+        let (alice_wallet, alice_key_pair) = create_wallet("alice-pass").expect("创建钱包应成功");
+        let contract_address = "contract-counter";
+
+        let _ = send_json(
+            &app,
+            Method::POST,
+            "/chain/mine",
+            json!({ "miner_address": alice_wallet.address.clone() }),
+        )
+        .await;
+
+        let mut tx = Transaction::new_with_kind(
+            TransactionKind::ContractCall,
+            alice_wallet.address.clone(),
+            contract_address,
+            1,
+            1,
+            Some(b"LOAD_CONST 2\nSTORE counter\nEMIT \"set\"\nHALT\n".to_vec()),
+        );
+        tx.sign_with_private_key(&alice_key_pair.private_key, &alice_key_pair.public_key)
+            .expect("签名应成功");
+
+        let (status, _) = send_json(
+            &app,
+            Method::POST,
+            "/chain/tx",
+            json!({ "transaction": tx }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+
+        let (status, _) = send_json(
+            &app,
+            Method::POST,
+            "/chain/mine",
+            json!({ "miner_address": "miner-2" }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+
+        let (status, body) = send_empty(
+            &app,
+            Method::GET,
+            &format!("/chain/contract/{contract_address}/state"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["state"]["counter"], json!(2));
+
+        let (status, body) = send_empty(
+            &app,
+            Method::GET,
+            &format!("/chain/contract/{contract_address}/events"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["events"][0], json!("set"));
     }
 
     /// 验证 VM 编译和执行接口可用。

@@ -42,6 +42,15 @@ pub struct Runtime {
 }
 
 impl Runtime {
+    /// 使用给定初始状态构造运行时，便于合约状态跨交易延续。
+    pub fn from_state(state: HashMap<String, i64>) -> Self {
+        Self {
+            stack: Vec::new(),
+            state,
+            events: Vec::new(),
+        }
+    }
+
     /// 默认执行入口，使用内置步数限制。
     pub fn execute(&mut self, program: &[Opcode]) -> Result<ExecutionReport, VmError> {
         self.execute_with_limit(program, 10_000)
@@ -186,6 +195,7 @@ impl Runtime {
 mod tests {
     use super::{Runtime, VmError};
     use crate::bytecode::Opcode;
+    use std::collections::HashMap;
 
     /// 验证运行时可以执行常量加载与变量存储。
     #[test]
@@ -314,5 +324,23 @@ mod tests {
                 key: "missing".to_string()
             })
         );
+    }
+
+    /// 验证可以基于初始状态继续执行并覆写变量。
+    #[test]
+    fn runtime_from_state_should_preserve_and_update_values() {
+        let mut state = HashMap::new();
+        state.insert("counter".to_string(), 41);
+        let mut runtime = Runtime::from_state(state);
+        let program = vec![
+            Opcode::Load("counter".to_string()),
+            Opcode::LoadConst(1),
+            Opcode::Add,
+            Opcode::Store("counter".to_string()),
+            Opcode::Halt,
+        ];
+
+        runtime.execute(&program).expect("执行应当成功");
+        assert_eq!(runtime.state().get("counter"), Some(&42));
     }
 }
