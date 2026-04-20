@@ -68,4 +68,13 @@ pub enum CoreError {
     /// 加密相关处理失败。
     #[error("加密处理失败: {0}")]
     CryptoOperationFailed(String),
+    /// 合约载荷不是合法 UTF-8 文本。
+    #[error("合约载荷编码非法: tx_id={tx_id}, reason={reason}")]
+    ContractPayloadEncodingInvalid { tx_id: String, reason: String },
+    /// 合约编译失败。
+    #[error("合约编译失败: tx_id={tx_id}, reason={reason}")]
+    ContractCompileFailed { tx_id: String, reason: String },
+    /// 合约执行失败。
+    #[error("合约执行失败: tx_id={tx_id}, reason={reason}")]
+    ContractExecutionFailed { tx_id: String, reason: String },
 }

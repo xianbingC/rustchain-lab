@@ -1,6 +1,6 @@
 use reqwest::{blocking::Client, Method};
 use rustchain_common::{logging::init_logging, AppConfig, AppError, AppResult};
-use rustchain_core::transaction::Transaction;
+use rustchain_core::transaction::{Transaction, TransactionKind};
 use rustchain_crypto::wallet::create_wallet;
 use serde_json::{json, Value};
 use std::fs;
@@ -156,7 +156,7 @@ fn run_sign_demo(args: &[String]) -> AppResult<()> {
 fn handle_chain_command(config: &AppConfig, args: &[String]) -> AppResult<()> {
     if args.len() < 2 {
         return Err(AppError::Command(
-            "chain 命令缺少子命令，可用: info/balance/mine/transfer/history-block/history-tx"
+            "chain 命令缺少子命令，可用: info/balance/mine/transfer/contract-call-file/history-block/history-tx"
                 .to_string(),
         ));
     }
@@ -201,6 +201,40 @@ fn handle_chain_command(config: &AppConfig, args: &[String]) -> AppResult<()> {
                 Some(json!({ "transaction": tx })),
             )?;
             print_json("chain_transfer_submit", response)
+        }
+        "contract-call-file" => {
+            let from = require_arg(args, 2, "from")?;
+            let to = require_arg(args, 3, "to")?;
+            let amount = parse_u64_arg(args, 4, "amount")?;
+            let private_key = require_arg(args, 5, "private_key")?;
+            let public_key = require_arg(args, 6, "public_key")?;
+            let source_path = require_arg(args, 7, "source_path")?;
+            let nonce = args
+                .get(8)
+                .map(|raw| {
+                    raw.parse::<u64>()
+                        .map_err(|error| AppError::Command(format!("nonce 参数解析失败: {error}")))
+                })
+                .transpose()?
+                .unwrap_or(0);
+            let payload = read_contract_source(source_path)?.into_bytes();
+
+            let tx = build_signed_contract_call_tx(
+                from,
+                to,
+                amount,
+                nonce,
+                private_key,
+                public_key,
+                payload,
+            )?;
+            let response = call_api_json(
+                config,
+                Method::POST,
+                "/chain/tx",
+                Some(json!({ "transaction": tx })),
+            )?;
+            print_json("chain_contract_call_submit", response)
         }
         "history-block" => {
             let block_hash = require_arg(args, 2, "block_hash")?;
@@ -535,6 +569,38 @@ fn build_signed_transfer_tx(
     Ok(tx)
 }
 
+/// 构造并签名一笔合约调用交易，用于提交到链交易接口。
+fn build_signed_contract_call_tx(
+    from: &str,
+    to: &str,
+    amount: u64,
+    nonce: u64,
+    private_key: &str,
+    public_key: &str,
+    payload: Vec<u8>,
+) -> AppResult<Transaction> {
+    if amount == 0 {
+        return Err(AppError::Command("amount 必须大于 0".to_string()));
+    }
+    if payload.is_empty() {
+        return Err(AppError::Command("payload 不能为空".to_string()));
+    }
+
+    let mut tx = Transaction::new_with_kind(
+        TransactionKind::ContractCall,
+        from.to_string(),
+        to.to_string(),
+        amount,
+        nonce,
+        Some(payload),
+    );
+    tx.sign_with_private_key(private_key, public_key)
+        .map_err(|error| AppError::Command(format!("交易签名失败: {error}")))?;
+    tx.validate_for_chain()
+        .map_err(|error| AppError::Command(format!("交易校验失败: {error}")))?;
+    Ok(tx)
+}
+
 /// 从文件读取合约源码文本。
 fn read_contract_source(path: &str) -> AppResult<String> {
     let source = fs::read_to_string(path)
@@ -556,6 +622,9 @@ fn print_help() {
     println!("  rustchain-cli chain mine <miner_address>");
     println!(
         "  rustchain-cli chain transfer <from> <to> <amount> <private_key> <public_key> [payload]"
+    );
+    println!(
+        "  rustchain-cli chain contract-call-file <from> <to> <amount> <private_key> <public_key> <source_path> [nonce]"
     );
     println!("  rustchain-cli chain history-block <block_hash>");
     println!("  rustchain-cli chain history-tx <tx_id>");
@@ -581,7 +650,10 @@ fn print_help() {
 
 #[cfg(test)]
 mod tests {
-    use super::{api_base_url, build_signed_transfer_tx, read_contract_source, require_arg};
+    use super::{
+        api_base_url, build_signed_contract_call_tx, build_signed_transfer_tx,
+        read_contract_source, require_arg,
+    };
     use rustchain_common::AppConfig;
     use rustchain_crypto::wallet::create_wallet;
     use std::{fs, path::PathBuf};
@@ -644,6 +716,31 @@ mod tests {
         );
 
         assert!(result.is_err());
+    }
+
+    /// 验证可以构造并签名合约调用交易。
+    #[test]
+    fn build_signed_contract_call_tx_should_work() {
+        let (sender_wallet, sender_key_pair) =
+            create_wallet("sender-pass").expect("钱包创建应成功");
+
+        let tx = build_signed_contract_call_tx(
+            &sender_wallet.address,
+            "contract-demo",
+            1,
+            9,
+            &sender_key_pair.private_key,
+            &sender_key_pair.public_key,
+            b"LOAD_CONST 1\nHALT\n".to_vec(),
+        )
+        .expect("合约调用交易构造应成功");
+
+        assert_eq!(
+            tx.kind,
+            rustchain_core::transaction::TransactionKind::ContractCall
+        );
+        assert_eq!(tx.nonce, 9);
+        assert!(tx.signature.is_some());
     }
 
     /// 验证命令参数读取逻辑支持历史查询场景。

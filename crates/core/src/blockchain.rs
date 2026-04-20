@@ -1,9 +1,10 @@
 use crate::{
     block::Block,
     error::CoreError,
-    transaction::Transaction,
+    transaction::{Transaction, TransactionKind},
     CoreResult,
 };
+use rustchain_vm::{compiler::compile, runtime::Runtime};
 use std::collections::HashMap;
 
 /// 区块链聚合结构，维护主链、交易池和已连接节点信息。
@@ -74,7 +75,10 @@ impl Blockchain {
     }
 
     /// 将当前交易池打包为新区块，并发放挖矿奖励。
-    pub fn mine_pending_transactions(&mut self, miner_address: impl Into<String>) -> CoreResult<Block> {
+    pub fn mine_pending_transactions(
+        &mut self,
+        miner_address: impl Into<String>,
+    ) -> CoreResult<Block> {
         let miner_address = miner_address.into();
         let reward_tx = Transaction::system(miner_address.clone(), self.mining_reward, None);
 
@@ -201,6 +205,7 @@ impl Blockchain {
         balances: &mut HashMap<String, u64>,
     ) -> CoreResult<()> {
         transaction.validate_for_chain()?;
+        self.validate_transaction_payload(transaction)?;
 
         if !transaction.is_system() {
             let available = balances.get(&transaction.from).copied().unwrap_or(0);
@@ -221,6 +226,48 @@ impl Blockchain {
             recipient_balance.saturating_add(transaction.amount),
         );
 
+        Ok(())
+    }
+
+    /// 校验并执行交易中附带的合约脚本载荷。
+    fn validate_transaction_payload(&self, transaction: &Transaction) -> CoreResult<()> {
+        if !matches!(
+            transaction.kind,
+            TransactionKind::ContractDeploy | TransactionKind::ContractCall
+        ) {
+            return Ok(());
+        }
+
+        let Some(raw_payload) = transaction.payload.as_ref() else {
+            return Ok(());
+        };
+
+        if raw_payload.is_empty() {
+            return Ok(());
+        }
+
+        let source = std::str::from_utf8(raw_payload).map_err(|error| {
+            CoreError::ContractPayloadEncodingInvalid {
+                tx_id: transaction.id.clone(),
+                reason: error.to_string(),
+            }
+        })?;
+
+        if source.trim().is_empty() {
+            return Ok(());
+        }
+
+        let program = compile(source).map_err(|error| CoreError::ContractCompileFailed {
+            tx_id: transaction.id.clone(),
+            reason: error.to_string(),
+        })?;
+        let mut runtime = Runtime::default();
+        runtime
+            .execute(&program)
+            .map_err(|error| CoreError::ContractExecutionFailed {
+                tx_id: transaction.id.clone(),
+                reason: error.to_string(),
+            })?;
         Ok(())
     }
 }
@@ -253,7 +300,12 @@ mod tests {
             .mine_pending_transactions(alice_wallet.address.clone())
             .expect("第一次挖矿应当成功");
 
-        let mut tx = Transaction::new(alice_wallet.address.clone(), bob_wallet.address.clone(), 20, None);
+        let mut tx = Transaction::new(
+            alice_wallet.address.clone(),
+            bob_wallet.address.clone(),
+            20,
+            None,
+        );
         tx.sign_with_private_key(&alice_key_pair.private_key, &alice_key_pair.public_key)
             .expect("交易签名应当成功");
         blockchain.add_transaction(tx).expect("交易应当可以入池");
@@ -262,17 +314,11 @@ mod tests {
             .expect("第二次挖矿应当成功");
 
         assert_eq!(
-            blockchain
-                .balances()
-                .get(&alice_wallet.address)
-                .copied(),
+            blockchain.balances().get(&alice_wallet.address).copied(),
             Some(30)
         );
         assert_eq!(
-            blockchain
-                .balances()
-                .get(&bob_wallet.address)
-                .copied(),
+            blockchain.balances().get(&bob_wallet.address).copied(),
             Some(20)
         );
         assert!(blockchain.validate_chain().is_ok());
@@ -305,5 +351,86 @@ mod tests {
                 actual: 1,
             })
         );
+    }
+
+    /// 验证携带合法合约脚本的交易可以入池。
+    #[test]
+    fn transaction_with_valid_contract_payload_should_be_accepted() {
+        let (alice_wallet, alice_key_pair) = create_wallet("alice-pass").expect("创建钱包应当成功");
+        let (bob_wallet, _) = create_wallet("bob-pass").expect("创建钱包应当成功");
+        let mut blockchain = Blockchain::new(1, 50);
+        blockchain
+            .mine_pending_transactions(alice_wallet.address.clone())
+            .expect("第一次挖矿应当成功");
+
+        let mut tx = Transaction::new(
+            alice_wallet.address.clone(),
+            bob_wallet.address.clone(),
+            10,
+            Some(b"LOAD_CONST 1\nSTORE x\nHALT\n".to_vec()),
+        );
+        tx.kind = TransactionKind::ContractCall;
+        tx.refresh_id();
+        tx.sign_with_private_key(&alice_key_pair.private_key, &alice_key_pair.public_key)
+            .expect("交易签名应当成功");
+
+        let result = blockchain.add_transaction(tx);
+        assert!(result.is_ok());
+    }
+
+    /// 验证合约编译失败的交易会被拒绝。
+    #[test]
+    fn transaction_with_invalid_contract_payload_should_be_rejected() {
+        let (alice_wallet, alice_key_pair) = create_wallet("alice-pass").expect("创建钱包应当成功");
+        let (bob_wallet, _) = create_wallet("bob-pass").expect("创建钱包应当成功");
+        let mut blockchain = Blockchain::new(1, 50);
+        blockchain
+            .mine_pending_transactions(alice_wallet.address.clone())
+            .expect("第一次挖矿应当成功");
+
+        let mut tx = Transaction::new(
+            alice_wallet.address.clone(),
+            bob_wallet.address.clone(),
+            10,
+            Some(b"WARP 1\n".to_vec()),
+        );
+        tx.kind = TransactionKind::ContractCall;
+        tx.refresh_id();
+        tx.sign_with_private_key(&alice_key_pair.private_key, &alice_key_pair.public_key)
+            .expect("交易签名应当成功");
+
+        let result = blockchain.add_transaction(tx);
+        assert!(matches!(
+            result,
+            Err(CoreError::ContractCompileFailed { .. })
+        ));
+    }
+
+    /// 验证合约运行时失败的交易会被拒绝。
+    #[test]
+    fn transaction_with_runtime_error_payload_should_be_rejected() {
+        let (alice_wallet, alice_key_pair) = create_wallet("alice-pass").expect("创建钱包应当成功");
+        let (bob_wallet, _) = create_wallet("bob-pass").expect("创建钱包应当成功");
+        let mut blockchain = Blockchain::new(1, 50);
+        blockchain
+            .mine_pending_transactions(alice_wallet.address.clone())
+            .expect("第一次挖矿应当成功");
+
+        let mut tx = Transaction::new(
+            alice_wallet.address.clone(),
+            bob_wallet.address.clone(),
+            10,
+            Some(b"LOAD_CONST 7\nLOAD_CONST 0\nDIV\nHALT\n".to_vec()),
+        );
+        tx.kind = TransactionKind::ContractCall;
+        tx.refresh_id();
+        tx.sign_with_private_key(&alice_key_pair.private_key, &alice_key_pair.public_key)
+            .expect("交易签名应当成功");
+
+        let result = blockchain.add_transaction(tx);
+        assert!(matches!(
+            result,
+            Err(CoreError::ContractExecutionFailed { .. })
+        ));
     }
 }

@@ -1296,7 +1296,7 @@ mod tests {
         http::{Method, Request, StatusCode},
         Router,
     };
-    use rustchain_core::transaction::Transaction;
+    use rustchain_core::transaction::{Transaction, TransactionKind};
     use rustchain_crypto::wallet::create_wallet;
     use serde_json::{json, Value};
     use tower::ServiceExt;
@@ -1606,6 +1606,42 @@ mod tests {
         let (status, body) = send_empty(&app, Method::GET, "/history/tx/not-exist").await;
 
         assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(body["ok"], json!(false));
+    }
+
+    /// 验证提交非法合约脚本交易时会被链交易接口拒绝。
+    #[tokio::test]
+    async fn chain_submit_invalid_contract_call_should_fail() {
+        let app = build_test_app();
+        let (alice_wallet, alice_key_pair) = create_wallet("alice-pass").expect("创建钱包应成功");
+
+        let _ = send_json(
+            &app,
+            Method::POST,
+            "/chain/mine",
+            json!({ "miner_address": alice_wallet.address.clone() }),
+        )
+        .await;
+
+        let mut tx = Transaction::new_with_kind(
+            TransactionKind::ContractCall,
+            alice_wallet.address.clone(),
+            "contract-demo",
+            1,
+            0,
+            Some(b"WARP 1\n".to_vec()),
+        );
+        tx.sign_with_private_key(&alice_key_pair.private_key, &alice_key_pair.public_key)
+            .expect("签名应成功");
+
+        let (status, body) = send_json(
+            &app,
+            Method::POST,
+            "/chain/tx",
+            json!({ "transaction": tx }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
         assert_eq!(body["ok"], json!(false));
     }
 
