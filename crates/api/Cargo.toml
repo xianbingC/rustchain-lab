@@ -12,6 +12,7 @@ rustchain-core = { path = "../core" }
 rustchain-crypto = { path = "../crypto" }
 rustchain-apps = { path = "../apps" }
 rustchain-storage = { path = "../storage" }
+rustchain-vm = { path = "../vm" }
 bincode.workspace = true
 serde.workspace = true
 serde_json.workspace = true

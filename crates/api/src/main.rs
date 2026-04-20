@@ -15,6 +15,10 @@ use rustchain_storage::{
     error::StorageError,
     history::{HistoryStore, LevelDbHistoryStore},
 };
+use rustchain_vm::{
+    compiler::{compile, CompileError},
+    runtime::{Runtime, VmError},
+};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::{
@@ -90,6 +94,22 @@ struct ChainSubmitTxRequest {
 struct ChainMineRequest {
     /// 矿工地址。
     miner_address: String,
+}
+
+/// VM 编译请求。
+#[derive(Debug, Deserialize)]
+struct VmCompileRequest {
+    /// 合约源码文本。
+    source: String,
+}
+
+/// VM 执行请求。
+#[derive(Debug, Deserialize)]
+struct VmExecuteRequest {
+    /// 合约源码文本。
+    source: String,
+    /// 可选步数上限。
+    max_steps: Option<usize>,
 }
 
 /// 链信息响应。
@@ -220,6 +240,8 @@ fn build_app(shared_state: AppState) -> Router {
         .route("/chain/mine", post(chain_mine_handler))
         .route("/history/block/:block_hash", get(history_block_handler))
         .route("/history/tx/:tx_id", get(history_tx_handler))
+        .route("/vm/compile", post(vm_compile_handler))
+        .route("/vm/execute", post(vm_execute_handler))
         .route("/defi/deposit", post(defi_deposit_handler))
         .route("/defi/borrow", post(defi_borrow_handler))
         .route("/defi/repay", post(defi_repay_handler))
@@ -462,6 +484,92 @@ async fn history_tx_handler(
             })),
         ),
         Err((status, body)) => (status, Json(body)),
+    }
+}
+
+/// VM 编译接口：将源码编译为指令序列。
+async fn vm_compile_handler(
+    Json(payload): Json<VmCompileRequest>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    if payload.source.trim().is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "ok": false,
+                "error": "source 不能为空"
+            })),
+        );
+    }
+
+    match compile(&payload.source) {
+        Ok(program) => (
+            StatusCode::OK,
+            Json(json!({
+                "ok": true,
+                "instruction_count": program.len(),
+                "program": program
+            })),
+        ),
+        Err(error) => {
+            let (status, body) = map_vm_compile_error(error);
+            (status, Json(body))
+        }
+    }
+}
+
+/// VM 执行接口：编译源码并执行，返回状态与事件。
+async fn vm_execute_handler(
+    Json(payload): Json<VmExecuteRequest>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    if payload.source.trim().is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "ok": false,
+                "error": "source 不能为空"
+            })),
+        );
+    }
+
+    let max_steps = payload.max_steps.unwrap_or(10_000);
+    if max_steps == 0 {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "ok": false,
+                "error": "max_steps 必须大于 0"
+            })),
+        );
+    }
+
+    let program = match compile(&payload.source) {
+        Ok(program) => program,
+        Err(error) => {
+            let (status, body) = map_vm_compile_error(error);
+            return (status, Json(body));
+        }
+    };
+
+    let mut runtime = Runtime::default();
+    match runtime.execute_with_limit(&program, max_steps) {
+        Ok(report) => (
+            StatusCode::OK,
+            Json(json!({
+                "ok": true,
+                "instruction_count": program.len(),
+                "report": {
+                    "halted": report.halted,
+                    "steps_executed": report.steps_executed,
+                    "final_pc": report.final_pc
+                },
+                "state": runtime.state(),
+                "events": runtime.events()
+            })),
+        ),
+        Err(error) => {
+            let (status, body) = map_vm_runtime_error(error);
+            (status, Json(body))
+        }
     }
 }
 
@@ -1150,6 +1258,28 @@ fn map_storage_error(error: StorageError) -> (StatusCode, serde_json::Value) {
     )
 }
 
+/// VM 编译错误映射为 HTTP 错误响应。
+fn map_vm_compile_error(error: CompileError) -> (StatusCode, serde_json::Value) {
+    (
+        StatusCode::BAD_REQUEST,
+        json!({
+            "ok": false,
+            "error": error.to_string()
+        }),
+    )
+}
+
+/// VM 运行时错误映射为 HTTP 错误响应。
+fn map_vm_runtime_error(error: VmError) -> (StatusCode, serde_json::Value) {
+    (
+        StatusCode::BAD_REQUEST,
+        json!({
+            "ok": false,
+            "error": error.to_string()
+        }),
+    )
+}
+
 /// 获取当前 Unix 秒级时间戳。
 fn now_unix_ts() -> i64 {
     SystemTime::now()
@@ -1476,6 +1606,87 @@ mod tests {
         let (status, body) = send_empty(&app, Method::GET, "/history/tx/not-exist").await;
 
         assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(body["ok"], json!(false));
+    }
+
+    /// 验证 VM 编译和执行接口可用。
+    #[tokio::test]
+    async fn vm_compile_and_execute_should_work() {
+        let app = build_test_app();
+        let source = r#"
+            LOAD_CONST 2
+            LOAD_CONST 3
+            ADD
+            STORE total
+            EMIT "sum_ready"
+            HALT
+        "#;
+
+        let (status, body) = send_json(
+            &app,
+            Method::POST,
+            "/vm/compile",
+            json!({ "source": source }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["ok"], json!(true));
+        assert_eq!(body["instruction_count"], json!(6));
+
+        let (status, body) = send_json(
+            &app,
+            Method::POST,
+            "/vm/execute",
+            json!({
+                "source": source,
+                "max_steps": 32
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["ok"], json!(true));
+        assert_eq!(body["state"]["total"], json!(5));
+        assert_eq!(body["events"][0], json!("sum_ready"));
+    }
+
+    /// 验证 VM 编译错误会返回 400。
+    #[tokio::test]
+    async fn vm_compile_invalid_opcode_should_return_bad_request() {
+        let app = build_test_app();
+        let (status, body) = send_json(
+            &app,
+            Method::POST,
+            "/vm/compile",
+            json!({ "source": "WARP 1" }),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["ok"], json!(false));
+    }
+
+    /// 验证 VM 运行时错误会返回 400。
+    #[tokio::test]
+    async fn vm_execute_runtime_error_should_return_bad_request() {
+        let app = build_test_app();
+        let source = r#"
+            LOAD_CONST 7
+            LOAD_CONST 0
+            DIV
+            HALT
+        "#;
+
+        let (status, body) = send_json(
+            &app,
+            Method::POST,
+            "/vm/execute",
+            json!({
+                "source": source
+            }),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::BAD_REQUEST);
         assert_eq!(body["ok"], json!(false));
     }
 
