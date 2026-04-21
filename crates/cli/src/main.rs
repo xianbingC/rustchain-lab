@@ -156,7 +156,7 @@ fn run_sign_demo(args: &[String]) -> AppResult<()> {
 fn handle_chain_command(config: &AppConfig, args: &[String]) -> AppResult<()> {
     if args.len() < 2 {
         return Err(AppError::Command(
-            "chain 命令缺少子命令，可用: info/balance/contract-state/contract-events/mine/transfer/contract-call-file/history-block/history-tx"
+            "chain 命令缺少子命令，可用: info/balance/contract-state/contract-events/contract-field/mine/transfer/contract-call-file/history-block/history-tx"
                 .to_string(),
         ));
     }
@@ -183,6 +183,13 @@ fn handle_chain_command(config: &AppConfig, args: &[String]) -> AppResult<()> {
             let path = format!("/chain/contract/{address}/events");
             let response = call_api_json(config, Method::GET, &path, None)?;
             print_json("chain_contract_events", response)
+        }
+        "contract-field" => {
+            let address = require_arg(args, 2, "address")?;
+            let field = require_arg(args, 3, "field")?;
+            let path = format!("/chain/contract/{address}/field/{field}");
+            let response = call_api_json(config, Method::GET, &path, None)?;
+            print_json("chain_contract_field", response)
         }
         "mine" => {
             let miner_address = require_arg(args, 2, "miner_address")?;
@@ -633,6 +640,7 @@ fn print_help() {
     println!("  rustchain-cli chain balance <address>");
     println!("  rustchain-cli chain contract-state <address>");
     println!("  rustchain-cli chain contract-events <address>");
+    println!("  rustchain-cli chain contract-field <address> <field>");
     println!("  rustchain-cli chain mine <miner_address>");
     println!(
         "  rustchain-cli chain transfer <from> <to> <amount> <private_key> <public_key> [payload]"

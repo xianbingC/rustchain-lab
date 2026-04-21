@@ -14,6 +14,7 @@ use rustchain_crypto::wallet::create_wallet;
 use rustchain_storage::{
     error::StorageError,
     history::{HistoryStore, LevelDbHistoryStore},
+    state::{InMemoryStateStore, StateStore},
 };
 use rustchain_vm::{
     compiler::{compile, CompileError},
@@ -22,11 +23,17 @@ use rustchain_vm::{
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::{
+    collections::HashMap,
     path::PathBuf,
     sync::{Arc, Mutex},
     time::{SystemTime, UNIX_EPOCH},
 };
 use tokio::net::TcpListener;
+
+/// 合约状态快照字段名。
+const CONTRACT_SNAPSHOT_FIELD: &str = "__snapshot__";
+/// 合约事件快照字段名。
+const CONTRACT_EVENTS_FIELD: &str = "__events__";
 
 /// API 程序入口。
 #[tokio::main]
@@ -177,6 +184,8 @@ async fn wallet_create_handler(
 struct AppState {
     /// 区块链状态（原型阶段使用内存存储）。
     blockchain: Arc<Mutex<Blockchain>>,
+    /// 状态存储（余额与合约状态）。
+    state_store: Arc<dyn StateStore + Send + Sync>,
     /// 历史数据存储。
     history_store: Arc<dyn HistoryStore + Send + Sync>,
     /// DeFi 借贷池（原型阶段使用内存存储）。
@@ -190,6 +199,7 @@ struct AppState {
 fn default_app_state() -> AppState {
     AppState {
         blockchain: Arc::new(Mutex::new(Blockchain::new(2, 50))),
+        state_store: Arc::new(InMemoryStateStore::new()),
         history_store: Arc::new(rustchain_storage::history::InMemoryHistoryStore::new()),
         lending_pool: Arc::new(Mutex::new(LendingPool::new(
             LendingConfig::default(),
@@ -201,12 +211,14 @@ fn default_app_state() -> AppState {
 
 /// 根据配置构造应用状态。
 fn default_app_state_with_config(config: &AppConfig) -> AppResult<AppState> {
+    let state_store = open_state_store(config)?;
     let history_store = open_history_store(config)?;
     Ok(AppState {
         blockchain: Arc::new(Mutex::new(Blockchain::new(
             config.mining_difficulty,
             config.mining_reward,
         ))),
+        state_store,
         history_store,
         lending_pool: Arc::new(Mutex::new(LendingPool::new(
             LendingConfig::default(),
@@ -214,6 +226,26 @@ fn default_app_state_with_config(config: &AppConfig) -> AppResult<AppState> {
         ))),
         nft_marketplace: Arc::new(Mutex::new(NftMarketplace::new())),
     })
+}
+
+/// 打开状态存储（RocksDB 或内存实现）。
+#[cfg(feature = "rocksdb-backend")]
+fn open_state_store(config: &AppConfig) -> AppResult<Arc<dyn StateStore + Send + Sync>> {
+    let path = PathBuf::from(&config.data_dir).join("state-rocksdb");
+    let store = rustchain_storage::state::RocksDbStateStore::open(&path).map_err(|error| {
+        rustchain_common::AppError::Command(format!(
+            "打开状态存储失败: path={}, error={error}",
+            path.display()
+        ))
+    })?;
+    Ok(Arc::new(store))
+}
+
+/// 打开状态存储（未启用 RocksDB 时回退内存实现）。
+#[cfg(not(feature = "rocksdb-backend"))]
+fn open_state_store(_config: &AppConfig) -> AppResult<Arc<dyn StateStore + Send + Sync>> {
+    tracing::warn!("未启用 rocksdb-backend，状态存储使用内存实现");
+    Ok(Arc::new(InMemoryStateStore::new()))
 }
 
 /// 打开历史存储（LevelDB）。
@@ -243,6 +275,10 @@ fn build_app(shared_state: AppState) -> Router {
         .route(
             "/chain/contract/:address/events",
             get(chain_contract_events_handler),
+        )
+        .route(
+            "/chain/contract/:address/field/:field",
+            get(chain_contract_field_handler),
         )
         .route("/chain/tx", post(chain_submit_tx_handler))
         .route("/chain/mine", post(chain_mine_handler))
@@ -330,15 +366,15 @@ async fn chain_balance_handler(
         );
     }
 
-    match with_chain(&state, |chain| {
-        let balance = chain.balances().get(&address).copied().unwrap_or(0);
-        Ok(json!({
-            "ok": true,
-            "address": address,
-            "balance": balance
-        }))
-    }) {
-        Ok(body) => (StatusCode::OK, Json(body)),
+    match with_state_store(&state, |store| store.get_balance(&address)) {
+        Ok(balance) => (
+            StatusCode::OK,
+            Json(json!({
+                "ok": true,
+                "address": address,
+                "balance": balance.unwrap_or(0)
+            })),
+        ),
         Err((status, body)) => (status, Json(body)),
     }
 }
@@ -358,15 +394,37 @@ async fn chain_contract_state_handler(
         );
     }
 
-    match with_chain(&state, |chain| {
-        let state_snapshot = chain.contract_state_snapshot(&address);
-        Ok(json!({
-            "ok": true,
-            "address": address,
-            "state": state_snapshot.unwrap_or_default()
-        }))
+    match with_state_store(&state, |store| {
+        store.get_contract_state(&address, CONTRACT_SNAPSHOT_FIELD)
     }) {
-        Ok(body) => (StatusCode::OK, Json(body)),
+        Ok(Some(raw)) => match bincode::deserialize::<HashMap<String, i64>>(&raw) {
+            Ok(snapshot) => (
+                StatusCode::OK,
+                Json(json!({
+                    "ok": true,
+                    "address": address,
+                    "state": snapshot
+                })),
+            ),
+            Err(error) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({
+                    "ok": false,
+                    "error": format!("合约状态反序列化失败: {error}")
+                })),
+            ),
+        },
+        Ok(None) => match with_chain(&state, |chain| Ok(chain.contract_state_snapshot(&address))) {
+            Ok(snapshot) => (
+                StatusCode::OK,
+                Json(json!({
+                    "ok": true,
+                    "address": address,
+                    "state": snapshot.unwrap_or_default()
+                })),
+            ),
+            Err((status, body)) => (status, Json(body)),
+        },
         Err((status, body)) => (status, Json(body)),
     }
 }
@@ -386,15 +444,101 @@ async fn chain_contract_events_handler(
         );
     }
 
-    match with_chain(&state, |chain| {
-        let events = chain.contract_events_snapshot(&address);
-        Ok(json!({
-            "ok": true,
-            "address": address,
-            "events": events
-        }))
+    match with_state_store(&state, |store| {
+        store.get_contract_state(&address, CONTRACT_EVENTS_FIELD)
     }) {
-        Ok(body) => (StatusCode::OK, Json(body)),
+        Ok(Some(raw)) => match bincode::deserialize::<Vec<String>>(&raw) {
+            Ok(events) => (
+                StatusCode::OK,
+                Json(json!({
+                    "ok": true,
+                    "address": address,
+                    "events": events
+                })),
+            ),
+            Err(error) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({
+                    "ok": false,
+                    "error": format!("合约事件反序列化失败: {error}")
+                })),
+            ),
+        },
+        Ok(None) => {
+            match with_chain(&state, |chain| Ok(chain.contract_events_snapshot(&address))) {
+                Ok(events) => (
+                    StatusCode::OK,
+                    Json(json!({
+                        "ok": true,
+                        "address": address,
+                        "events": events
+                    })),
+                ),
+                Err((status, body)) => (status, Json(body)),
+            }
+        }
+        Err((status, body)) => (status, Json(body)),
+    }
+}
+
+/// 合约状态字段查询接口。
+async fn chain_contract_field_handler(
+    State(state): State<AppState>,
+    Path((address, field)): Path<(String, String)>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    if address.trim().is_empty() || field.trim().is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "ok": false,
+                "error": "address 和 field 不能为空"
+            })),
+        );
+    }
+
+    match with_state_store(&state, |store| store.get_contract_state(&address, &field)) {
+        Ok(Some(raw)) => {
+            let i64_value = decode_i64_from_le_bytes(&raw);
+            (
+                StatusCode::OK,
+                Json(json!({
+                    "ok": true,
+                    "address": address,
+                    "field": field,
+                    "value_bytes": raw,
+                    "value_i64": i64_value
+                })),
+            )
+        }
+        Ok(None) => match with_chain(&state, |chain| Ok(chain.contract_state_snapshot(&address))) {
+            Ok(Some(snapshot)) => match snapshot.get(&field) {
+                Some(value) => (
+                    StatusCode::OK,
+                    Json(json!({
+                        "ok": true,
+                        "address": address,
+                        "field": field,
+                        "value_bytes": value.to_le_bytes(),
+                        "value_i64": value
+                    })),
+                ),
+                None => (
+                    StatusCode::NOT_FOUND,
+                    Json(json!({
+                        "ok": false,
+                        "error": format!("合约字段不存在: address={address}, field={field}")
+                    })),
+                ),
+            },
+            Ok(None) => (
+                StatusCode::NOT_FOUND,
+                Json(json!({
+                    "ok": false,
+                    "error": format!("合约字段不存在: address={address}, field={field}")
+                })),
+            ),
+            Err((status, body)) => (status, Json(body)),
+        },
         Err((status, body)) => (status, Json(body)),
     }
 }
@@ -432,16 +576,37 @@ async fn chain_mine_handler(
     }
 
     let history_store = state.history_store.clone();
+    let state_store = state.state_store.clone();
     match with_chain_mut(&state, |chain| {
-        chain.mine_pending_transactions(&payload.miner_address)
+        let block = chain.mine_pending_transactions(&payload.miner_address)?;
+        Ok((
+            block,
+            chain.balances(),
+            chain.contract_states.clone(),
+            chain.contract_events.clone(),
+        ))
     }) {
-        Ok(block) => {
+        Ok((block, balances, contract_states, contract_events)) => {
             if let Err(error) = persist_mined_block(history_store.as_ref(), &block) {
                 return (
                     StatusCode::INTERNAL_SERVER_ERROR,
                     Json(json!({
                         "ok": false,
                         "error": format!("持久化历史数据失败: {error}")
+                    })),
+                );
+            }
+            if let Err(error) = persist_runtime_state(
+                state_store.as_ref(),
+                &balances,
+                &contract_states,
+                &contract_events,
+            ) {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({
+                        "ok": false,
+                        "error": format!("持久化状态数据失败: {error}")
                     })),
                 );
             }
@@ -1242,6 +1407,14 @@ fn with_history<T>(
     f(state.history_store.as_ref()).map_err(map_storage_error)
 }
 
+/// 访问状态存储。
+fn with_state_store<T>(
+    state: &AppState,
+    f: impl FnOnce(&dyn StateStore) -> Result<T, StorageError>,
+) -> Result<T, (StatusCode, serde_json::Value)> {
+    f(state.state_store.as_ref()).map_err(map_storage_error)
+}
+
 /// 持久化新挖出的区块及其交易历史。
 fn persist_mined_block(history: &dyn HistoryStore, block: &Block) -> Result<(), StorageError> {
     let block_bytes =
@@ -1255,6 +1428,47 @@ fn persist_mined_block(history: &dyn HistoryStore, block: &Block) -> Result<(), 
     }
 
     Ok(())
+}
+
+/// 持久化当前链状态（余额与合约状态/事件）。
+fn persist_runtime_state(
+    state_store: &dyn StateStore,
+    balances: &HashMap<String, u64>,
+    contract_states: &HashMap<String, HashMap<String, i64>>,
+    contract_events: &HashMap<String, Vec<String>>,
+) -> Result<(), StorageError> {
+    for (address, balance) in balances {
+        state_store.set_balance(address, *balance)?;
+    }
+
+    for (contract, fields) in contract_states {
+        for (field, value) in fields {
+            state_store.set_contract_state(contract, field, &value.to_le_bytes())?;
+        }
+
+        let snapshot =
+            bincode::serialize(fields).map_err(|error| StorageError::Codec(error.to_string()))?;
+        state_store.set_contract_state(contract, CONTRACT_SNAPSHOT_FIELD, &snapshot)?;
+    }
+
+    for (contract, events) in contract_events {
+        let raw_events =
+            bincode::serialize(events).map_err(|error| StorageError::Codec(error.to_string()))?;
+        state_store.set_contract_state(contract, CONTRACT_EVENTS_FIELD, &raw_events)?;
+    }
+
+    Ok(())
+}
+
+/// 将 8 字节小端编码解码为 i64，长度不合法时返回 None。
+fn decode_i64_from_le_bytes(raw: &[u8]) -> Option<i64> {
+    if raw.len() != 8 {
+        return None;
+    }
+
+    let mut bytes = [0u8; 8];
+    bytes.copy_from_slice(raw);
+    Some(i64::from_le_bytes(bytes))
 }
 
 /// DeFi 业务错误映射为 HTTP 错误响应。
@@ -1770,6 +1984,15 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body["events"][0], json!("set"));
+
+        let (status, body) = send_empty(
+            &app,
+            Method::GET,
+            &format!("/chain/contract/{contract_address}/field/counter"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["value_i64"], json!(2));
     }
 
     /// 验证 VM 编译和执行接口可用。
