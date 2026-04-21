@@ -117,6 +117,11 @@ impl PeerRegistry {
             .collect()
     }
 
+    /// 获取全部节点快照（克隆），便于上层做只读展示。
+    pub fn snapshot(&self) -> Vec<PeerInfo> {
+        self.peers.values().cloned().collect()
+    }
+
     /// 标记节点断开。
     pub fn mark_disconnected(&mut self, id: &str) {
         if let Some(peer) = self.peers.get_mut(id) {
@@ -166,5 +171,16 @@ mod tests {
         let connected = registry.connected_peers();
         assert_eq!(connected.len(), 1);
         assert_eq!(connected[0].id, "node-a");
+    }
+
+    /// 验证节点快照可以返回全部节点。
+    #[test]
+    fn snapshot_should_include_all_peers() {
+        let mut registry = PeerRegistry::new();
+        registry.upsert("node-a", "/ip4/127.0.0.1/tcp/7001");
+        registry.upsert("node-b", "/ip4/127.0.0.1/tcp/7002");
+
+        let snapshot = registry.snapshot();
+        assert_eq!(snapshot.len(), 2);
     }
 }

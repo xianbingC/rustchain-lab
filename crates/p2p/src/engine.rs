@@ -5,10 +5,11 @@ use crate::{
     peer::PeerRegistry,
     queue::{OrderedMessageQueue, SequencedMessage},
 };
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
 /// 待发送消息信封，交给传输层处理。
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OutboundEnvelope {
     /// 目标节点 ID。
     pub target_peer_id: String,
@@ -17,7 +18,7 @@ pub struct OutboundEnvelope {
 }
 
 /// 单次处理报告，便于上层统计。
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct ProcessReport {
     /// 本次处理的消息数量。
     pub processed: usize,
@@ -123,11 +124,33 @@ impl SyncEngine {
         &self.peers
     }
 
+    /// 返回全部节点快照。
+    pub fn peer_snapshot(&self) -> Vec<crate::peer::PeerInfo> {
+        self.peers.snapshot()
+    }
+
+    /// 返回当前已知节点数。
+    pub fn peer_count(&self) -> usize {
+        self.peers.len()
+    }
+
     /// 获取某节点的下一期望序号。
     pub fn next_expected_sequence(&self, peer_id: &str) -> Option<u64> {
         self.queues
             .get(peer_id)
             .map(OrderedMessageQueue::next_expected)
+    }
+
+    /// 广播消息到当前已连接节点。
+    pub fn broadcast_to_connected(&self, message: NetworkMessage) -> Vec<OutboundEnvelope> {
+        self.peers
+            .connected_peers()
+            .into_iter()
+            .map(|peer| OutboundEnvelope {
+                target_peer_id: peer.id.clone(),
+                message: message.clone(),
+            })
+            .collect()
     }
 
     /// 处理单条已就绪消息。
@@ -317,5 +340,26 @@ mod tests {
                 limit: 128,
             }
         );
+    }
+
+    /// 验证广播仅面向已连接节点。
+    #[test]
+    fn broadcast_should_target_connected_peers() {
+        let mut engine = SyncEngine::new("local-node", local_status(2));
+        engine.register_peer("peer-a", "/ip4/127.0.0.1/tcp/7001");
+        engine.register_peer("peer-b", "/ip4/127.0.0.1/tcp/7002");
+
+        let _ = engine
+            .on_incoming_message(
+                "peer-a",
+                "/ip4/127.0.0.1/tcp/7001",
+                1,
+                NetworkMessage::GetChainStatus,
+            )
+            .expect("处理应当成功");
+
+        let outbound = engine.broadcast_to_connected(NetworkMessage::GetMempool);
+        assert_eq!(outbound.len(), 1);
+        assert_eq!(outbound[0].target_peer_id, "peer-a");
     }
 }

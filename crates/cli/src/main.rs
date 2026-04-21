@@ -3,7 +3,10 @@ use rustchain_common::{logging::init_logging, AppConfig, AppError, AppResult};
 use rustchain_core::transaction::{Transaction, TransactionKind};
 use rustchain_crypto::wallet::create_wallet;
 use serde_json::{json, Value};
-use std::fs;
+use std::{
+    fs,
+    time::{SystemTime, UNIX_EPOCH},
+};
 
 /// CLI 程序入口。
 fn main() {
@@ -41,6 +44,7 @@ fn dispatch_command(config: &AppConfig, args: &[String]) -> AppResult<()> {
         "wallet" => handle_wallet_command(args),
         "tx" => handle_tx_command(args),
         "chain" => handle_chain_command(config, args),
+        "p2p" => handle_p2p_command(config, args),
         "vm" => handle_vm_command(config, args),
         "defi" => handle_defi_command(config, args),
         "nft" => handle_nft_command(config, args),
@@ -268,6 +272,94 @@ fn handle_chain_command(config: &AppConfig, args: &[String]) -> AppResult<()> {
             print_json("chain_history_tx", response)
         }
         other => Err(AppError::Command(format!("未知 chain 子命令: {other}"))),
+    }
+}
+
+/// 处理 P2P 相关命令（通过 API 调用）。
+fn handle_p2p_command(config: &AppConfig, args: &[String]) -> AppResult<()> {
+    if args.len() < 2 {
+        return Err(AppError::Command(
+            "p2p 命令缺少子命令，可用: status/peers/register-peer/ping/get-chain-status"
+                .to_string(),
+        ));
+    }
+
+    match args[1].as_str() {
+        "status" => {
+            let response = call_api_json(config, Method::GET, "/p2p/status", None)?;
+            print_json("p2p_status", response)
+        }
+        "peers" => {
+            let response = call_api_json(config, Method::GET, "/p2p/peers", None)?;
+            print_json("p2p_peers", response)
+        }
+        "register-peer" => {
+            let peer_id = require_arg(args, 2, "peer_id")?;
+            let address = require_arg(args, 3, "address")?;
+            let response = call_api_json(
+                config,
+                Method::POST,
+                "/p2p/peer/register",
+                Some(json!({
+                    "peer_id": peer_id,
+                    "address": address
+                })),
+            )?;
+            print_json("p2p_register_peer", response)
+        }
+        "ping" => {
+            let peer_id = require_arg(args, 2, "peer_id")?;
+            let address = require_arg(args, 3, "address")?;
+            let sequence = parse_u64_arg(args, 4, "sequence")?;
+            let nonce = args
+                .get(5)
+                .map(|raw| {
+                    raw.parse::<u64>()
+                        .map_err(|error| AppError::Command(format!("nonce 参数解析失败: {error}")))
+                })
+                .transpose()?
+                .unwrap_or(sequence);
+            let timestamp = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|duration| duration.as_secs() as i64)
+                .unwrap_or(0);
+
+            let response = call_api_json(
+                config,
+                Method::POST,
+                "/p2p/message",
+                Some(json!({
+                    "peer_id": peer_id,
+                    "address": address,
+                    "sequence": sequence,
+                    "message": {
+                        "Ping": {
+                            "nonce": nonce,
+                            "timestamp": timestamp
+                        }
+                    }
+                })),
+            )?;
+            print_json("p2p_ping", response)
+        }
+        "get-chain-status" => {
+            let peer_id = require_arg(args, 2, "peer_id")?;
+            let address = require_arg(args, 3, "address")?;
+            let sequence = parse_u64_arg(args, 4, "sequence")?;
+            let response = call_api_json(
+                config,
+                Method::POST,
+                "/p2p/message",
+                Some(json!({
+                    "peer_id": peer_id,
+                    "address": address,
+                    "sequence": sequence,
+                    "message": "GetChainStatus"
+                })),
+            )?;
+            print_json("p2p_get_chain_status", response)
+        }
+        other => Err(AppError::Command(format!("未知 p2p 子命令: {other}"))),
     }
 }
 
@@ -650,6 +742,11 @@ fn print_help() {
     );
     println!("  rustchain-cli chain history-block <block_hash>");
     println!("  rustchain-cli chain history-tx <tx_id>");
+    println!("  rustchain-cli p2p status");
+    println!("  rustchain-cli p2p peers");
+    println!("  rustchain-cli p2p register-peer <peer_id> <address>");
+    println!("  rustchain-cli p2p ping <peer_id> <address> <sequence> [nonce]");
+    println!("  rustchain-cli p2p get-chain-status <peer_id> <address> <sequence>");
     println!("  rustchain-cli vm compile-file <source_path>");
     println!("  rustchain-cli vm execute-file <source_path> [max_steps]");
     println!("  rustchain-cli defi deposit <owner> <amount>");

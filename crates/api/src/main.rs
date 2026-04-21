@@ -11,6 +11,10 @@ use rustchain_core::block::Block;
 use rustchain_core::blockchain::Blockchain;
 use rustchain_core::transaction::Transaction;
 use rustchain_crypto::wallet::create_wallet;
+use rustchain_p2p::{
+    engine::SyncEngine,
+    message::{ChainStatus, NetworkMessage},
+};
 use rustchain_storage::{
     error::StorageError,
     history::{HistoryStore, LevelDbHistoryStore},
@@ -103,6 +107,28 @@ struct ChainMineRequest {
     miner_address: String,
 }
 
+/// P2P 节点注册请求。
+#[derive(Debug, Deserialize)]
+struct P2pRegisterPeerRequest {
+    /// 节点 ID。
+    peer_id: String,
+    /// 节点地址。
+    address: String,
+}
+
+/// P2P 入站消息请求。
+#[derive(Debug, Deserialize)]
+struct P2pIncomingMessageRequest {
+    /// 来源节点 ID。
+    peer_id: String,
+    /// 来源节点地址。
+    address: String,
+    /// 连接内递增序号。
+    sequence: u64,
+    /// 网络消息内容。
+    message: NetworkMessage,
+}
+
 /// VM 编译请求。
 #[derive(Debug, Deserialize)]
 struct VmCompileRequest {
@@ -184,6 +210,8 @@ async fn wallet_create_handler(
 struct AppState {
     /// 区块链状态（原型阶段使用内存存储）。
     blockchain: Arc<Mutex<Blockchain>>,
+    /// P2P 同步引擎。
+    p2p_engine: Arc<Mutex<SyncEngine>>,
     /// 状态存储（余额与合约状态）。
     state_store: Arc<dyn StateStore + Send + Sync>,
     /// 历史数据存储。
@@ -197,8 +225,11 @@ struct AppState {
 /// 构造默认应用状态。
 #[cfg(test)]
 fn default_app_state() -> AppState {
+    let blockchain = Blockchain::new(2, 50);
+    let chain_status = chain_status_from_blockchain(&blockchain);
     AppState {
-        blockchain: Arc::new(Mutex::new(Blockchain::new(2, 50))),
+        blockchain: Arc::new(Mutex::new(blockchain)),
+        p2p_engine: Arc::new(Mutex::new(SyncEngine::new("api-test-node", chain_status))),
         state_store: Arc::new(InMemoryStateStore::new()),
         history_store: Arc::new(rustchain_storage::history::InMemoryHistoryStore::new()),
         lending_pool: Arc::new(Mutex::new(LendingPool::new(
@@ -211,13 +242,14 @@ fn default_app_state() -> AppState {
 
 /// 根据配置构造应用状态。
 fn default_app_state_with_config(config: &AppConfig) -> AppResult<AppState> {
+    let blockchain = Blockchain::new(config.mining_difficulty, config.mining_reward);
+    let chain_status = chain_status_from_blockchain(&blockchain);
+    let local_peer_id = format!("{}-node", config.app_name);
     let state_store = open_state_store(config)?;
     let history_store = open_history_store(config)?;
     Ok(AppState {
-        blockchain: Arc::new(Mutex::new(Blockchain::new(
-            config.mining_difficulty,
-            config.mining_reward,
-        ))),
+        blockchain: Arc::new(Mutex::new(blockchain)),
+        p2p_engine: Arc::new(Mutex::new(SyncEngine::new(local_peer_id, chain_status))),
         state_store,
         history_store,
         lending_pool: Arc::new(Mutex::new(LendingPool::new(
@@ -260,12 +292,31 @@ fn open_history_store(config: &AppConfig) -> AppResult<Arc<dyn HistoryStore + Se
     Ok(Arc::new(store))
 }
 
+/// 根据当前链状态生成 P2P 链摘要。
+fn chain_status_from_blockchain(chain: &Blockchain) -> ChainStatus {
+    let latest = chain
+        .latest_block()
+        .cloned()
+        .unwrap_or_else(|_| Block::genesis());
+    ChainStatus {
+        chain_id: chain.chain_id.clone(),
+        best_height: latest.index,
+        best_hash: latest.hash,
+        difficulty: chain.difficulty,
+        genesis_hash: Block::genesis().hash,
+    }
+}
+
 /// 构造 API 路由。
 fn build_app(shared_state: AppState) -> Router {
     Router::new()
         .route("/health", get(health_handler))
         .route("/wallet/create", post(wallet_create_handler))
         .route("/tx/verify", post(tx_verify_handler))
+        .route("/p2p/status", get(p2p_status_handler))
+        .route("/p2p/peers", get(p2p_peers_handler))
+        .route("/p2p/peer/register", post(p2p_register_peer_handler))
+        .route("/p2p/message", post(p2p_message_handler))
         .route("/chain/info", get(chain_info_handler))
         .route("/chain/balance/:address", get(chain_balance_handler))
         .route(
@@ -324,6 +375,109 @@ async fn tx_verify_handler(
                 "error": error.to_string()
             })),
         ),
+    }
+}
+
+/// P2P 状态查询接口。
+async fn p2p_status_handler(
+    State(state): State<AppState>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    match with_p2p(&state, |engine| {
+        Ok(json!({
+            "ok": true,
+            "local_peer_id": engine.local_peer_id(),
+            "local_chain_status": engine.local_chain_status(),
+            "peer_count": engine.peer_count()
+        }))
+    }) {
+        Ok(body) => (StatusCode::OK, Json(body)),
+        Err((status, body)) => (status, Json(body)),
+    }
+}
+
+/// P2P 节点列表查询接口。
+async fn p2p_peers_handler(State(state): State<AppState>) -> (StatusCode, Json<serde_json::Value>) {
+    match with_p2p(&state, |engine| {
+        Ok(json!({
+            "ok": true,
+            "peers": engine.peer_snapshot()
+        }))
+    }) {
+        Ok(body) => (StatusCode::OK, Json(body)),
+        Err((status, body)) => (status, Json(body)),
+    }
+}
+
+/// P2P 节点注册接口。
+async fn p2p_register_peer_handler(
+    State(state): State<AppState>,
+    Json(payload): Json<P2pRegisterPeerRequest>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    if payload.peer_id.trim().is_empty() || payload.address.trim().is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "ok": false,
+                "error": "peer_id 和 address 不能为空"
+            })),
+        );
+    }
+
+    let peer_address = payload.address.trim().to_string();
+    let peer_id = payload.peer_id.trim().to_string();
+    match with_p2p_mut(&state, |engine| {
+        engine.register_peer(peer_id.clone(), peer_address.clone());
+        Ok(engine.peer_count())
+    }) {
+        Ok(peer_count) => {
+            if let Err((status, body)) = with_chain_mut(&state, |chain| {
+                chain.add_peer(peer_address.clone());
+                Ok(())
+            }) {
+                return (status, Json(body));
+            }
+            (
+                StatusCode::OK,
+                Json(json!({
+                    "ok": true,
+                    "peer_count": peer_count
+                })),
+            )
+        }
+        Err((status, body)) => (status, Json(body)),
+    }
+}
+
+/// P2P 入站消息模拟接口。
+async fn p2p_message_handler(
+    State(state): State<AppState>,
+    Json(payload): Json<P2pIncomingMessageRequest>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    if payload.peer_id.trim().is_empty() || payload.address.trim().is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "ok": false,
+                "error": "peer_id 和 address 不能为空"
+            })),
+        );
+    }
+
+    let peer_id = payload.peer_id.trim().to_string();
+    let peer_address = payload.address.trim().to_string();
+    match with_p2p_mut(&state, |engine| {
+        engine.on_incoming_message(peer_id, peer_address, payload.sequence, payload.message)
+    }) {
+        Ok(report) => (
+            StatusCode::OK,
+            Json(json!({
+                "ok": true,
+                "processed": report.processed,
+                "outbound_count": report.outbound.len(),
+                "outbound": report.outbound
+            })),
+        ),
+        Err((status, body)) => (status, Json(body)),
     }
 }
 
@@ -548,14 +702,45 @@ async fn chain_submit_tx_handler(
     State(state): State<AppState>,
     Json(payload): Json<ChainSubmitTxRequest>,
 ) -> (StatusCode, Json<serde_json::Value>) {
+    let tx = payload.transaction.clone();
     match with_chain_mut(&state, |chain| {
-        chain.add_transaction(payload.transaction.clone())?;
-        Ok(json!({
-            "ok": true,
-            "pending_tx_count": chain.pending_transactions.len()
-        }))
+        chain.add_transaction(tx.clone())?;
+        Ok(chain.pending_transactions.len())
     }) {
-        Ok(body) => (StatusCode::OK, Json(body)),
+        Ok(pending_tx_count) => {
+            let tx_bytes = match bincode::serialize(&tx) {
+                Ok(bytes) => bytes,
+                Err(error) => {
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(json!({
+                            "ok": false,
+                            "error": format!("交易序列化失败: {error}")
+                        })),
+                    );
+                }
+            };
+            let broadcast = match with_p2p(&state, |engine| {
+                Ok(
+                    engine.broadcast_to_connected(NetworkMessage::NewTransaction {
+                        transaction: tx_bytes,
+                    }),
+                )
+            }) {
+                Ok(outbound) => outbound,
+                Err((status, body)) => return (status, Json(body)),
+            };
+
+            (
+                StatusCode::OK,
+                Json(json!({
+                    "ok": true,
+                    "pending_tx_count": pending_tx_count,
+                    "p2p_outbound_count": broadcast.len(),
+                    "p2p_outbound": broadcast
+                })),
+            )
+        }
         Err((status, body)) => (status, Json(body)),
     }
 }
@@ -579,14 +764,16 @@ async fn chain_mine_handler(
     let state_store = state.state_store.clone();
     match with_chain_mut(&state, |chain| {
         let block = chain.mine_pending_transactions(&payload.miner_address)?;
+        let chain_status = chain_status_from_blockchain(chain);
         Ok((
             block,
+            chain_status,
             chain.balances(),
             chain.contract_states.clone(),
             chain.contract_events.clone(),
         ))
     }) {
-        Ok((block, balances, contract_states, contract_events)) => {
+        Ok((block, chain_status, balances, contract_states, contract_events)) => {
             if let Err(error) = persist_mined_block(history_store.as_ref(), &block) {
                 return (
                     StatusCode::INTERNAL_SERVER_ERROR,
@@ -611,6 +798,26 @@ async fn chain_mine_handler(
                 );
             }
 
+            let block_bytes = match bincode::serialize(&block) {
+                Ok(bytes) => bytes,
+                Err(error) => {
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(json!({
+                            "ok": false,
+                            "error": format!("区块序列化失败: {error}")
+                        })),
+                    );
+                }
+            };
+            let broadcast = match with_p2p_mut(&state, |engine| {
+                engine.update_local_chain_status(chain_status.clone());
+                Ok(engine.broadcast_to_connected(NetworkMessage::NewBlock { block: block_bytes }))
+            }) {
+                Ok(outbound) => outbound,
+                Err((status, body)) => return (status, Json(body)),
+            };
+
             (
                 StatusCode::OK,
                 Json(json!({
@@ -622,7 +829,9 @@ async fn chain_mine_handler(
                         "tx_count": block.transactions.len(),
                         "difficulty": block.difficulty,
                         "nonce": block.nonce
-                    }
+                    },
+                    "p2p_outbound_count": broadcast.len(),
+                    "p2p_outbound": broadcast
                 })),
             )
         }
@@ -1327,6 +1536,42 @@ fn with_chain_mut<T>(
     f(&mut guard).map_err(map_core_error)
 }
 
+/// 只读访问 P2P 引擎。
+fn with_p2p<T>(
+    state: &AppState,
+    f: impl FnOnce(&SyncEngine) -> Result<T, rustchain_p2p::P2pError>,
+) -> Result<T, (StatusCode, serde_json::Value)> {
+    let guard = state.p2p_engine.lock().map_err(|_| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            json!({
+                "ok": false,
+                "error": "p2p_engine 锁异常"
+            }),
+        )
+    })?;
+
+    f(&guard).map_err(map_p2p_error)
+}
+
+/// 可变访问 P2P 引擎。
+fn with_p2p_mut<T>(
+    state: &AppState,
+    f: impl FnOnce(&mut SyncEngine) -> Result<T, rustchain_p2p::P2pError>,
+) -> Result<T, (StatusCode, serde_json::Value)> {
+    let mut guard = state.p2p_engine.lock().map_err(|_| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            json!({
+                "ok": false,
+                "error": "p2p_engine 锁异常"
+            }),
+        )
+    })?;
+
+    f(&mut guard).map_err(map_p2p_error)
+}
+
 /// 只读访问借贷池。
 fn with_pool<T>(
     state: &AppState,
@@ -1536,6 +1781,25 @@ fn map_storage_error(error: StorageError) -> (StatusCode, serde_json::Value) {
     )
 }
 
+/// P2P 错误映射为 HTTP 错误响应。
+fn map_p2p_error(error: rustchain_p2p::P2pError) -> (StatusCode, serde_json::Value) {
+    let status = match error {
+        rustchain_p2p::P2pError::InvalidArgument(_)
+        | rustchain_p2p::P2pError::InvalidMessage(_)
+        | rustchain_p2p::P2pError::StaleSequence { .. } => StatusCode::BAD_REQUEST,
+        rustchain_p2p::P2pError::Serialize(_) | rustchain_p2p::P2pError::Deserialize(_) => {
+            StatusCode::INTERNAL_SERVER_ERROR
+        }
+    };
+    (
+        status,
+        json!({
+            "ok": false,
+            "error": error.to_string()
+        }),
+    )
+}
+
 /// VM 编译错误映射为 HTTP 错误响应。
 fn map_vm_compile_error(error: CompileError) -> (StatusCode, serde_json::Value) {
     (
@@ -1658,6 +1922,118 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body["balance"], json!(20));
+    }
+
+    /// 验证 P2P 节点注册与 Ping/Pong 消息处理流程。
+    #[tokio::test]
+    async fn p2p_register_and_ping_should_work() {
+        let app = build_test_app();
+
+        let (status, body) = send_json(
+            &app,
+            Method::POST,
+            "/p2p/peer/register",
+            json!({
+                "peer_id": "peer-a",
+                "address": "/ip4/127.0.0.1/tcp/7001"
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["peer_count"], json!(1));
+
+        let (status, body) = send_empty(&app, Method::GET, "/p2p/status").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["peer_count"], json!(1));
+
+        let (status, body) = send_json(
+            &app,
+            Method::POST,
+            "/p2p/message",
+            json!({
+                "peer_id": "peer-a",
+                "address": "/ip4/127.0.0.1/tcp/7001",
+                "sequence": 1,
+                "message": {
+                    "Ping": {
+                        "nonce": 7,
+                        "timestamp": 99
+                    }
+                }
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["processed"], json!(1));
+        assert_eq!(body["outbound_count"], json!(1));
+    }
+
+    /// 验证链交易提交与挖矿会触发 P2P 广播。
+    #[tokio::test]
+    async fn chain_actions_should_broadcast_to_connected_peers() {
+        let app = build_test_app();
+        let (alice_wallet, alice_key_pair) = create_wallet("alice-pass").expect("创建钱包应成功");
+        let (bob_wallet, _) = create_wallet("bob-pass").expect("创建钱包应成功");
+
+        let _ = send_json(
+            &app,
+            Method::POST,
+            "/p2p/peer/register",
+            json!({
+                "peer_id": "peer-a",
+                "address": "/ip4/127.0.0.1/tcp/7001"
+            }),
+        )
+        .await;
+        let _ = send_json(
+            &app,
+            Method::POST,
+            "/p2p/message",
+            json!({
+                "peer_id": "peer-a",
+                "address": "/ip4/127.0.0.1/tcp/7001",
+                "sequence": 1,
+                "message": "GetChainStatus"
+            }),
+        )
+        .await;
+
+        let _ = send_json(
+            &app,
+            Method::POST,
+            "/chain/mine",
+            json!({ "miner_address": alice_wallet.address.clone() }),
+        )
+        .await;
+
+        let mut tx = Transaction::new(
+            alice_wallet.address.clone(),
+            bob_wallet.address.clone(),
+            10,
+            Some(b"api-p2p-broadcast".to_vec()),
+        );
+        tx.sign_with_private_key(&alice_key_pair.private_key, &alice_key_pair.public_key)
+            .expect("签名应成功");
+
+        let (status, body) = send_json(
+            &app,
+            Method::POST,
+            "/chain/tx",
+            json!({ "transaction": tx }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["p2p_outbound_count"], json!(1));
+
+        let (status, body) = send_json(
+            &app,
+            Method::POST,
+            "/chain/mine",
+            json!({ "miner_address": "miner-2" }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["p2p_outbound_count"], json!(1));
     }
 
     /// 验证 DeFi 抵押、借款和仓位查询主流程。
