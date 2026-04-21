@@ -12,7 +12,7 @@ use rustchain_core::blockchain::Blockchain;
 use rustchain_core::transaction::Transaction;
 use rustchain_crypto::wallet::create_wallet;
 use rustchain_p2p::{
-    engine::SyncEngine,
+    engine::{OutboundEnvelope, SyncEngine},
     message::{ChainStatus, NetworkMessage},
 };
 use rustchain_storage::{
@@ -465,20 +465,134 @@ async fn p2p_message_handler(
 
     let peer_id = payload.peer_id.trim().to_string();
     let peer_address = payload.address.trim().to_string();
-    match with_p2p_mut(&state, |engine| {
-        engine.on_incoming_message(peer_id, peer_address, payload.sequence, payload.message)
+    let incoming_message = payload.message.clone();
+    let mut report = match with_p2p_mut(&state, |engine| {
+        engine.on_incoming_message(
+            peer_id.clone(),
+            peer_address,
+            payload.sequence,
+            incoming_message.clone(),
+        )
     }) {
-        Ok(report) => (
-            StatusCode::OK,
-            Json(json!({
-                "ok": true,
-                "processed": report.processed,
-                "outbound_count": report.outbound.len(),
-                "outbound": report.outbound
-            })),
-        ),
-        Err((status, body)) => (status, Json(body)),
+        Ok(report) => report,
+        Err((status, body)) => return (status, Json(body)),
+    };
+
+    match incoming_message {
+        NetworkMessage::NewTransaction { transaction } => {
+            let tx = match bincode::deserialize::<Transaction>(&transaction) {
+                Ok(tx) => tx,
+                Err(error) => {
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        Json(json!({
+                            "ok": false,
+                            "error": format!("反序列化交易失败: {error}")
+                        })),
+                    );
+                }
+            };
+            if let Err((status, body)) = with_chain_mut(&state, |chain| {
+                chain.add_transaction(tx)?;
+                Ok(())
+            }) {
+                return (status, Json(body));
+            }
+        }
+        NetworkMessage::NewBlock { block } => {
+            let block = match bincode::deserialize::<Block>(&block) {
+                Ok(block) => block,
+                Err(error) => {
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        Json(json!({
+                            "ok": false,
+                            "error": format!("反序列化区块失败: {error}")
+                        })),
+                    );
+                }
+            };
+            if let Err((status, body)) = accept_synced_block(&state, block) {
+                return (status, Json(body));
+            }
+        }
+        NetworkMessage::Blocks { blocks } => {
+            for raw in blocks {
+                let block = match bincode::deserialize::<Block>(&raw) {
+                    Ok(block) => block,
+                    Err(error) => {
+                        return (
+                            StatusCode::BAD_REQUEST,
+                            Json(json!({
+                                "ok": false,
+                                "error": format!("反序列化区块失败: {error}")
+                            })),
+                        );
+                    }
+                };
+                if let Err((status, body)) = accept_synced_block(&state, block) {
+                    return (status, Json(body));
+                }
+            }
+        }
+        NetworkMessage::GetBlocks { from_height, limit } => {
+            let blocks = match with_chain(&state, |chain| {
+                Ok(chain
+                    .chain
+                    .iter()
+                    .filter(|block| block.index >= from_height)
+                    .take(limit as usize)
+                    .cloned()
+                    .collect::<Vec<_>>())
+            }) {
+                Ok(blocks) => blocks,
+                Err((status, body)) => return (status, Json(body)),
+            };
+            let encoded_blocks = match encode_blocks(blocks) {
+                Ok(encoded) => encoded,
+                Err(error) => {
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(json!({
+                            "ok": false,
+                            "error": format!("区块编码失败: {error}")
+                        })),
+                    );
+                }
+            };
+            let mut replaced = false;
+            for envelope in &mut report.outbound {
+                if envelope.target_peer_id == peer_id
+                    && matches!(envelope.message, NetworkMessage::Blocks { .. })
+                {
+                    envelope.message = NetworkMessage::Blocks {
+                        blocks: encoded_blocks.clone(),
+                    };
+                    replaced = true;
+                    break;
+                }
+            }
+            if !replaced {
+                report.outbound.push(OutboundEnvelope {
+                    target_peer_id: peer_id,
+                    message: NetworkMessage::Blocks {
+                        blocks: encoded_blocks,
+                    },
+                });
+            }
+        }
+        _ => {}
     }
+
+    (
+        StatusCode::OK,
+        Json(json!({
+            "ok": true,
+            "processed": report.processed,
+            "outbound_count": report.outbound.len(),
+            "outbound": report.outbound
+        })),
+    )
 }
 
 /// 链信息查询接口。
@@ -1705,6 +1819,48 @@ fn persist_runtime_state(
     Ok(())
 }
 
+/// 编码区块列表为网络传输字节。
+fn encode_blocks(blocks: Vec<Block>) -> Result<Vec<Vec<u8>>, bincode::Error> {
+    blocks
+        .into_iter()
+        .map(|block| bincode::serialize(&block))
+        .collect()
+}
+
+/// 接收同步区块并完成链、历史、状态和 P2P 摘要更新。
+fn accept_synced_block(
+    state: &AppState,
+    block: Block,
+) -> Result<(), (StatusCode, serde_json::Value)> {
+    let history_store = state.history_store.clone();
+    let state_store = state.state_store.clone();
+    let (chain_status, balances, contract_states, contract_events) =
+        with_chain_mut(state, |chain| {
+            chain.append_external_block(block.clone())?;
+            Ok((
+                chain_status_from_blockchain(chain),
+                chain.balances(),
+                chain.contract_states.clone(),
+                chain.contract_events.clone(),
+            ))
+        })?;
+
+    persist_mined_block(history_store.as_ref(), &block).map_err(map_storage_error)?;
+    persist_runtime_state(
+        state_store.as_ref(),
+        &balances,
+        &contract_states,
+        &contract_events,
+    )
+    .map_err(map_storage_error)?;
+    with_p2p_mut(state, |engine| {
+        engine.update_local_chain_status(chain_status);
+        Ok(())
+    })?;
+
+    Ok(())
+}
+
 /// 将 8 字节小端编码解码为 i64，长度不合法时返回 None。
 fn decode_i64_from_le_bytes(raw: &[u8]) -> Option<i64> {
     if raw.len() != 8 {
@@ -1838,6 +1994,7 @@ mod tests {
         http::{Method, Request, StatusCode},
         Router,
     };
+    use rustchain_core::blockchain::Blockchain;
     use rustchain_core::transaction::{Transaction, TransactionKind};
     use rustchain_crypto::wallet::create_wallet;
     use serde_json::{json, Value};
@@ -2034,6 +2191,135 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body["p2p_outbound_count"], json!(1));
+    }
+
+    /// 验证 P2P GetBlocks 会返回真实区块数据。
+    #[tokio::test]
+    async fn p2p_get_blocks_should_return_real_blocks() {
+        let app = build_test_app();
+        let (miner_wallet, _) = create_wallet("miner-pass").expect("创建钱包应成功");
+
+        let _ = send_json(
+            &app,
+            Method::POST,
+            "/chain/mine",
+            json!({ "miner_address": miner_wallet.address.clone() }),
+        )
+        .await;
+        let _ = send_json(
+            &app,
+            Method::POST,
+            "/chain/mine",
+            json!({ "miner_address": miner_wallet.address.clone() }),
+        )
+        .await;
+
+        let (status, body) = send_json(
+            &app,
+            Method::POST,
+            "/p2p/message",
+            json!({
+                "peer_id": "peer-a",
+                "address": "/ip4/127.0.0.1/tcp/7001",
+                "sequence": 1,
+                "message": {
+                    "GetBlocks": {
+                        "from_height": 1,
+                        "limit": 10
+                    }
+                }
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["outbound_count"], json!(1));
+        let blocks = body["outbound"][0]["message"]["Blocks"]["blocks"]
+            .as_array()
+            .expect("blocks 应为数组");
+        assert_eq!(blocks.len(), 2);
+    }
+
+    /// 验证 P2P NewTransaction 会导入本地交易池。
+    #[tokio::test]
+    async fn p2p_new_transaction_should_import_to_mempool() {
+        let app = build_test_app();
+        let (alice_wallet, alice_key_pair) = create_wallet("alice-pass").expect("创建钱包应成功");
+        let (bob_wallet, _) = create_wallet("bob-pass").expect("创建钱包应成功");
+
+        let _ = send_json(
+            &app,
+            Method::POST,
+            "/chain/mine",
+            json!({ "miner_address": alice_wallet.address.clone() }),
+        )
+        .await;
+
+        let mut tx = Transaction::new(
+            alice_wallet.address.clone(),
+            bob_wallet.address.clone(),
+            5,
+            Some(b"p2p-sync-tx".to_vec()),
+        );
+        tx.sign_with_private_key(&alice_key_pair.private_key, &alice_key_pair.public_key)
+            .expect("签名应成功");
+        let tx_bytes = bincode::serialize(&tx).expect("交易编码应成功");
+
+        let (status, body) = send_json(
+            &app,
+            Method::POST,
+            "/p2p/message",
+            json!({
+                "peer_id": "peer-a",
+                "address": "/ip4/127.0.0.1/tcp/7001",
+                "sequence": 1,
+                "message": {
+                    "NewTransaction": {
+                        "transaction": tx_bytes
+                    }
+                }
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["ok"], json!(true));
+
+        let (status, body) = send_empty(&app, Method::GET, "/chain/info").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["chain"]["pending_tx_count"], json!(1));
+    }
+
+    /// 验证 P2P NewBlock 会同步并追加本地区块。
+    #[tokio::test]
+    async fn p2p_new_block_should_sync_chain() {
+        let app = build_test_app();
+        let mut remote_chain = Blockchain::new(2, 50);
+        let block = remote_chain
+            .mine_pending_transactions("remote-miner")
+            .expect("远端出块应成功");
+        let block_bytes = bincode::serialize(&block).expect("区块编码应成功");
+
+        let (status, body) = send_json(
+            &app,
+            Method::POST,
+            "/p2p/message",
+            json!({
+                "peer_id": "peer-a",
+                "address": "/ip4/127.0.0.1/tcp/7001",
+                "sequence": 1,
+                "message": {
+                    "NewBlock": {
+                        "block": block_bytes
+                    }
+                }
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["ok"], json!(true));
+
+        let (status, body) = send_empty(&app, Method::GET, "/chain/info").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["chain"]["height"], json!(1));
     }
 
     /// 验证 DeFi 抵押、借款和仓位查询主流程。

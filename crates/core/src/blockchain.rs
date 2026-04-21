@@ -122,6 +122,23 @@ impl Blockchain {
         Ok(candidate_block)
     }
 
+    /// 接收外部同步区块并追加到当前主链。
+    pub fn append_external_block(&mut self, block: Block) -> CoreResult<()> {
+        self.validate_next_block(&block)?;
+        self.apply_contract_state_transitions(&block.transactions)?;
+        self.chain.push(block.clone());
+
+        // 将已确认区块中的交易从待打包池移除，避免重复打包。
+        let confirmed_ids = block
+            .transactions
+            .iter()
+            .map(|tx| tx.id.clone())
+            .collect::<std::collections::HashSet<_>>();
+        self.pending_transactions
+            .retain(|pending| !confirmed_ids.contains(&pending.id));
+        Ok(())
+    }
+
     /// 根据当前主链计算账户余额快照。
     pub fn balances(&self) -> HashMap<String, u64> {
         let mut balances = HashMap::new();
@@ -571,6 +588,26 @@ mod tests {
         assert_eq!(
             blockchain.contract_events_snapshot(contract_address),
             vec!["init".to_string(), "inc".to_string()]
+        );
+    }
+
+    /// 验证可以接收并追加外部区块。
+    #[test]
+    fn append_external_block_should_work() {
+        let mut local_chain = Blockchain::new(1, 50);
+        let mut remote_chain = Blockchain::new(1, 50);
+
+        let block = remote_chain
+            .mine_pending_transactions("remote-miner")
+            .expect("远端出块应成功");
+        local_chain
+            .append_external_block(block.clone())
+            .expect("追加外部区块应成功");
+
+        assert_eq!(local_chain.chain.len(), 2);
+        assert_eq!(
+            local_chain.latest_block().expect("应存在最新区块").hash,
+            block.hash
         );
     }
 }
