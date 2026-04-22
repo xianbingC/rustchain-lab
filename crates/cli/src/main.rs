@@ -1,5 +1,6 @@
 use reqwest::{blocking::Client, Method};
 use rustchain_common::{logging::init_logging, AppConfig, AppError, AppResult};
+use rustchain_core::block::Block;
 use rustchain_core::transaction::{Transaction, TransactionKind};
 use rustchain_crypto::wallet::create_wallet;
 use serde_json::{json, Value};
@@ -279,7 +280,7 @@ fn handle_chain_command(config: &AppConfig, args: &[String]) -> AppResult<()> {
 fn handle_p2p_command(config: &AppConfig, args: &[String]) -> AppResult<()> {
     if args.len() < 2 {
         return Err(AppError::Command(
-            "p2p 命令缺少子命令，可用: status/peers/register-peer/ping/get-chain-status"
+            "p2p 命令缺少子命令，可用: status/peers/register-peer/ping/get-chain-status/chain-status/get-blocks"
                 .to_string(),
         ));
     }
@@ -358,6 +359,73 @@ fn handle_p2p_command(config: &AppConfig, args: &[String]) -> AppResult<()> {
                 })),
             )?;
             print_json("p2p_get_chain_status", response)
+        }
+        "chain-status" => {
+            let peer_id = require_arg(args, 2, "peer_id")?;
+            let address = require_arg(args, 3, "address")?;
+            let sequence = parse_u64_arg(args, 4, "sequence")?;
+            let best_height = parse_u64_arg(args, 5, "best_height")?;
+            let best_hash = require_arg(args, 6, "best_hash")?;
+            let difficulty = args
+                .get(7)
+                .map(|raw| {
+                    raw.parse::<u32>().map_err(|error| {
+                        AppError::Command(format!("difficulty 参数解析失败: {error}"))
+                    })
+                })
+                .transpose()?
+                .unwrap_or(config.mining_difficulty);
+            let response = call_api_json(
+                config,
+                Method::POST,
+                "/p2p/message",
+                Some(json!({
+                    "peer_id": peer_id,
+                    "address": address,
+                    "sequence": sequence,
+                    "message": {
+                        "ChainStatus": {
+                            "chain_id": "rustchain-lab-dev",
+                            "best_height": best_height,
+                            "best_hash": best_hash,
+                            "difficulty": difficulty,
+                            "genesis_hash": Block::genesis().hash
+                        }
+                    }
+                })),
+            )?;
+            print_json("p2p_chain_status", response)
+        }
+        "get-blocks" => {
+            let peer_id = require_arg(args, 2, "peer_id")?;
+            let address = require_arg(args, 3, "address")?;
+            let sequence = parse_u64_arg(args, 4, "sequence")?;
+            let from_height = parse_u64_arg(args, 5, "from_height")?;
+            let limit = args
+                .get(6)
+                .map(|raw| {
+                    raw.parse::<u32>()
+                        .map_err(|error| AppError::Command(format!("limit 参数解析失败: {error}")))
+                })
+                .transpose()?
+                .unwrap_or(128);
+            let response = call_api_json(
+                config,
+                Method::POST,
+                "/p2p/message",
+                Some(json!({
+                    "peer_id": peer_id,
+                    "address": address,
+                    "sequence": sequence,
+                    "message": {
+                        "GetBlocks": {
+                            "from_height": from_height,
+                            "limit": limit
+                        }
+                    }
+                })),
+            )?;
+            print_json("p2p_get_blocks", response)
         }
         other => Err(AppError::Command(format!("未知 p2p 子命令: {other}"))),
     }
@@ -747,6 +815,10 @@ fn print_help() {
     println!("  rustchain-cli p2p register-peer <peer_id> <address>");
     println!("  rustchain-cli p2p ping <peer_id> <address> <sequence> [nonce]");
     println!("  rustchain-cli p2p get-chain-status <peer_id> <address> <sequence>");
+    println!(
+        "  rustchain-cli p2p chain-status <peer_id> <address> <sequence> <best_height> <best_hash> [difficulty]"
+    );
+    println!("  rustchain-cli p2p get-blocks <peer_id> <address> <sequence> <from_height> [limit]");
     println!("  rustchain-cli vm compile-file <source_path>");
     println!("  rustchain-cli vm execute-file <source_path> [max_steps]");
     println!("  rustchain-cli defi deposit <owner> <amount>");
