@@ -517,6 +517,7 @@ async fn p2p_message_handler(
             }
         }
         NetworkMessage::Blocks { blocks } => {
+            let received_count = blocks.len();
             for raw in blocks {
                 let block = match bincode::deserialize::<Block>(&raw) {
                     Ok(block) => block,
@@ -533,6 +534,81 @@ async fn p2p_message_handler(
                 if let Err((status, body)) = accept_synced_block(&state, block) {
                     return (status, Json(body));
                 }
+            }
+
+            // 仅在本次确实收到区块时尝试续拉，避免对空响应形成无意义循环请求。
+            if received_count > 0 {
+                let next_request = match build_next_get_blocks_request(&state, &peer_id) {
+                    Ok(request) => request,
+                    Err((status, body)) => return (status, Json(body)),
+                };
+                if let Some(message) = next_request {
+                    report.outbound.push(OutboundEnvelope {
+                        target_peer_id: peer_id.clone(),
+                        message,
+                    });
+                }
+            }
+        }
+        NetworkMessage::Mempool { transactions } => {
+            for raw in transactions {
+                let tx = match bincode::deserialize::<Transaction>(&raw) {
+                    Ok(tx) => tx,
+                    Err(error) => {
+                        return (
+                            StatusCode::BAD_REQUEST,
+                            Json(json!({
+                                "ok": false,
+                                "error": format!("反序列化交易失败: {error}")
+                            })),
+                        );
+                    }
+                };
+                if let Err((status, body)) = with_chain_mut(&state, |chain| {
+                    chain.add_transaction(tx)?;
+                    Ok(())
+                }) {
+                    return (status, Json(body));
+                }
+            }
+        }
+        NetworkMessage::GetMempool => {
+            let transactions =
+                match with_chain(&state, |chain| Ok(chain.pending_transactions.clone())) {
+                    Ok(transactions) => transactions,
+                    Err((status, body)) => return (status, Json(body)),
+                };
+            let encoded_transactions = match encode_transactions(transactions) {
+                Ok(encoded) => encoded,
+                Err(error) => {
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(json!({
+                            "ok": false,
+                            "error": format!("交易编码失败: {error}")
+                        })),
+                    );
+                }
+            };
+            let mut replaced = false;
+            for envelope in &mut report.outbound {
+                if envelope.target_peer_id == peer_id
+                    && matches!(envelope.message, NetworkMessage::Mempool { .. })
+                {
+                    envelope.message = NetworkMessage::Mempool {
+                        transactions: encoded_transactions.clone(),
+                    };
+                    replaced = true;
+                    break;
+                }
+            }
+            if !replaced {
+                report.outbound.push(OutboundEnvelope {
+                    target_peer_id: peer_id.clone(),
+                    message: NetworkMessage::Mempool {
+                        transactions: encoded_transactions,
+                    },
+                });
             }
         }
         NetworkMessage::GetBlocks { from_height, limit } => {
@@ -1827,6 +1903,14 @@ fn encode_blocks(blocks: Vec<Block>) -> Result<Vec<Vec<u8>>, bincode::Error> {
         .collect()
 }
 
+/// 编码交易列表为网络传输字节。
+fn encode_transactions(transactions: Vec<Transaction>) -> Result<Vec<Vec<u8>>, bincode::Error> {
+    transactions
+        .into_iter()
+        .map(|tx| bincode::serialize(&tx))
+        .collect()
+}
+
 /// 接收同步区块并完成链、历史、状态和 P2P 摘要更新。
 fn accept_synced_block(
     state: &AppState,
@@ -1859,6 +1943,32 @@ fn accept_synced_block(
     })?;
 
     Ok(())
+}
+
+/// 根据本地/远端高度判断是否需要继续拉取下一批区块。
+fn build_next_get_blocks_request(
+    state: &AppState,
+    peer_id: &str,
+) -> Result<Option<NetworkMessage>, (StatusCode, serde_json::Value)> {
+    let local_height = with_chain(state, |chain| Ok(chain.latest_block()?.index))?;
+    let peer_best_height = with_p2p(state, |engine| {
+        Ok(engine.peers().get(peer_id).map(|p| p.best_height))
+    })?;
+
+    let Some(peer_best_height) = peer_best_height else {
+        return Ok(None);
+    };
+    if peer_best_height <= local_height {
+        return Ok(None);
+    }
+
+    // 单批最多 128，和同步引擎默认请求窗口保持一致，便于分批追平。
+    let remaining = peer_best_height.saturating_sub(local_height);
+    let limit = remaining.min(128) as u32;
+    Ok(Some(NetworkMessage::GetBlocks {
+        from_height: local_height.saturating_add(1),
+        limit,
+    }))
 }
 
 /// 将 8 字节小端编码解码为 i64，长度不合法时返回 None。
@@ -1994,6 +2104,7 @@ mod tests {
         http::{Method, Request, StatusCode},
         Router,
     };
+    use rustchain_core::block::Block;
     use rustchain_core::blockchain::Blockchain;
     use rustchain_core::transaction::{Transaction, TransactionKind};
     use rustchain_crypto::wallet::create_wallet;
@@ -2288,6 +2399,113 @@ mod tests {
         assert_eq!(body["chain"]["pending_tx_count"], json!(1));
     }
 
+    /// 验证 P2P GetMempool 会返回真实交易池快照。
+    #[tokio::test]
+    async fn p2p_get_mempool_should_return_real_transactions() {
+        let app = build_test_app();
+        let (alice_wallet, alice_key_pair) = create_wallet("alice-pass").expect("创建钱包应成功");
+        let (bob_wallet, _) = create_wallet("bob-pass").expect("创建钱包应成功");
+
+        let _ = send_json(
+            &app,
+            Method::POST,
+            "/chain/mine",
+            json!({ "miner_address": alice_wallet.address.clone() }),
+        )
+        .await;
+
+        let mut tx = Transaction::new(
+            alice_wallet.address.clone(),
+            bob_wallet.address.clone(),
+            6,
+            Some(b"p2p-get-mempool".to_vec()),
+        );
+        tx.sign_with_private_key(&alice_key_pair.private_key, &alice_key_pair.public_key)
+            .expect("签名应成功");
+        let tx_id = tx.id.clone();
+        let _ = send_json(
+            &app,
+            Method::POST,
+            "/chain/tx",
+            json!({ "transaction": tx }),
+        )
+        .await;
+
+        let (status, body) = send_json(
+            &app,
+            Method::POST,
+            "/p2p/message",
+            json!({
+                "peer_id": "peer-a",
+                "address": "/ip4/127.0.0.1/tcp/7001",
+                "sequence": 1,
+                "message": "GetMempool"
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["outbound_count"], json!(1));
+
+        let tx_list = body["outbound"][0]["message"]["Mempool"]["transactions"]
+            .as_array()
+            .expect("transactions 应为数组");
+        assert_eq!(tx_list.len(), 1);
+
+        let raw: Vec<u8> =
+            serde_json::from_value(tx_list[0].clone()).expect("交易字节应可反序列化");
+        let decoded_tx: Transaction = bincode::deserialize(&raw).expect("交易应可反序列化");
+        assert_eq!(decoded_tx.id, tx_id);
+    }
+
+    /// 验证 P2P Mempool 会批量导入交易到本地交易池。
+    #[tokio::test]
+    async fn p2p_mempool_should_import_transactions() {
+        let app = build_test_app();
+        let (alice_wallet, alice_key_pair) = create_wallet("alice-pass").expect("创建钱包应成功");
+        let (bob_wallet, _) = create_wallet("bob-pass").expect("创建钱包应成功");
+
+        let _ = send_json(
+            &app,
+            Method::POST,
+            "/chain/mine",
+            json!({ "miner_address": alice_wallet.address.clone() }),
+        )
+        .await;
+
+        let mut tx = Transaction::new(
+            alice_wallet.address.clone(),
+            bob_wallet.address.clone(),
+            7,
+            Some(b"p2p-import-mempool".to_vec()),
+        );
+        tx.sign_with_private_key(&alice_key_pair.private_key, &alice_key_pair.public_key)
+            .expect("签名应成功");
+        let tx_bytes = bincode::serialize(&tx).expect("交易编码应成功");
+
+        let (status, body) = send_json(
+            &app,
+            Method::POST,
+            "/p2p/message",
+            json!({
+                "peer_id": "peer-a",
+                "address": "/ip4/127.0.0.1/tcp/7001",
+                "sequence": 1,
+                "message": {
+                    "Mempool": {
+                        "transactions": [tx_bytes]
+                    }
+                }
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["ok"], json!(true));
+
+        let (status, body) = send_empty(&app, Method::GET, "/chain/info").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["chain"]["pending_tx_count"], json!(1));
+    }
+
     /// 验证 P2P NewBlock 会同步并追加本地区块。
     #[tokio::test]
     async fn p2p_new_block_should_sync_chain() {
@@ -2320,6 +2538,66 @@ mod tests {
         let (status, body) = send_empty(&app, Method::GET, "/chain/info").await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body["chain"]["height"], json!(1));
+    }
+
+    /// 验证接收 Blocks 后若仍落后，会继续请求下一批区块。
+    #[tokio::test]
+    async fn p2p_blocks_should_request_next_batch_when_still_behind() {
+        let app = build_test_app();
+        let mut remote_chain = Blockchain::new(2, 50);
+        let block = remote_chain
+            .mine_pending_transactions("remote-miner")
+            .expect("远端出块应成功");
+        let block_bytes = bincode::serialize(&block).expect("区块编码应成功");
+
+        let (status, _) = send_json(
+            &app,
+            Method::POST,
+            "/p2p/message",
+            json!({
+                "peer_id": "peer-a",
+                "address": "/ip4/127.0.0.1/tcp/7001",
+                "sequence": 1,
+                "message": {
+                    "ChainStatus": {
+                        "chain_id": "rustchain-lab-dev",
+                        "best_height": 5,
+                        "best_hash": "remote-tip-5",
+                        "difficulty": 2,
+                        "genesis_hash": Block::genesis().hash
+                    }
+                }
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+
+        let (status, body) = send_json(
+            &app,
+            Method::POST,
+            "/p2p/message",
+            json!({
+                "peer_id": "peer-a",
+                "address": "/ip4/127.0.0.1/tcp/7001",
+                "sequence": 2,
+                "message": {
+                    "Blocks": {
+                        "blocks": [block_bytes]
+                    }
+                }
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["outbound_count"], json!(1));
+        assert_eq!(
+            body["outbound"][0]["message"]["GetBlocks"]["from_height"],
+            json!(2)
+        );
+        assert_eq!(
+            body["outbound"][0]["message"]["GetBlocks"]["limit"],
+            json!(4)
+        );
     }
 
     /// 验证 DeFi 抵押、借款和仓位查询主流程。

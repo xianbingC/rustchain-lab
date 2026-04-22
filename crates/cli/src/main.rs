@@ -280,7 +280,7 @@ fn handle_chain_command(config: &AppConfig, args: &[String]) -> AppResult<()> {
 fn handle_p2p_command(config: &AppConfig, args: &[String]) -> AppResult<()> {
     if args.len() < 2 {
         return Err(AppError::Command(
-            "p2p 命令缺少子命令，可用: status/peers/register-peer/ping/get-chain-status/chain-status/get-blocks"
+            "p2p 命令缺少子命令，可用: status/peers/register-peer/ping/get-chain-status/chain-status/get-blocks/get-mempool"
                 .to_string(),
         ));
     }
@@ -359,6 +359,23 @@ fn handle_p2p_command(config: &AppConfig, args: &[String]) -> AppResult<()> {
                 })),
             )?;
             print_json("p2p_get_chain_status", response)
+        }
+        "get-mempool" => {
+            let peer_id = require_arg(args, 2, "peer_id")?;
+            let address = require_arg(args, 3, "address")?;
+            let sequence = parse_u64_arg(args, 4, "sequence")?;
+            let response = call_api_json(
+                config,
+                Method::POST,
+                "/p2p/message",
+                Some(json!({
+                    "peer_id": peer_id,
+                    "address": address,
+                    "sequence": sequence,
+                    "message": "GetMempool"
+                })),
+            )?;
+            print_json("p2p_get_mempool", response)
         }
         "chain-status" => {
             let peer_id = require_arg(args, 2, "peer_id")?;
@@ -815,6 +832,7 @@ fn print_help() {
     println!("  rustchain-cli p2p register-peer <peer_id> <address>");
     println!("  rustchain-cli p2p ping <peer_id> <address> <sequence> [nonce]");
     println!("  rustchain-cli p2p get-chain-status <peer_id> <address> <sequence>");
+    println!("  rustchain-cli p2p get-mempool <peer_id> <address> <sequence>");
     println!(
         "  rustchain-cli p2p chain-status <peer_id> <address> <sequence> <best_height> <best_hash> [difficulty]"
     );
