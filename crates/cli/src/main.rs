@@ -161,7 +161,7 @@ fn run_sign_demo(args: &[String]) -> AppResult<()> {
 fn handle_chain_command(config: &AppConfig, args: &[String]) -> AppResult<()> {
     if args.len() < 2 {
         return Err(AppError::Command(
-            "chain 命令缺少子命令，可用: info/block/mempool/balance/contract-state/contract-events/contract-field/mine/transfer/contract-call-file/history-block/history-tx"
+            "chain 命令缺少子命令，可用: info/blocks/block/mempool/balance/contract-state/contract-events/contract-field/mine/transfer/contract-call-file/history-block/history-tx"
                 .to_string(),
         ));
     }
@@ -170,6 +170,41 @@ fn handle_chain_command(config: &AppConfig, args: &[String]) -> AppResult<()> {
         "info" => {
             let response = call_api_json(config, Method::GET, "/chain/info", None)?;
             print_json("chain_info", response)
+        }
+        "blocks" => {
+            let from_height = args
+                .get(2)
+                .map(|raw| {
+                    raw.parse::<u64>().map_err(|error| {
+                        AppError::Command(format!("from_height 参数解析失败: {error}"))
+                    })
+                })
+                .transpose()?;
+            let limit = args
+                .get(3)
+                .map(|raw| {
+                    raw.parse::<usize>()
+                        .map_err(|error| AppError::Command(format!("limit 参数解析失败: {error}")))
+                })
+                .transpose()?;
+            if let Some(limit) = limit {
+                if limit == 0 || limit > 200 {
+                    return Err(AppError::Command("limit 必须在 1~200 之间".to_string()));
+                }
+            }
+            let mut path = "/chain/blocks".to_string();
+            match (from_height, limit) {
+                (Some(from_height), Some(limit)) => {
+                    path = format!("/chain/blocks?from_height={from_height}&limit={limit}")
+                }
+                (Some(from_height), None) => {
+                    path = format!("/chain/blocks?from_height={from_height}")
+                }
+                (None, Some(limit)) => path = format!("/chain/blocks?limit={limit}"),
+                (None, None) => {}
+            }
+            let response = call_api_json(config, Method::GET, &path, None)?;
+            print_json("chain_blocks", response)
         }
         "block" => {
             let height = parse_u64_arg(args, 2, "height")?;
@@ -836,6 +871,7 @@ fn print_help() {
     println!("  rustchain-cli wallet create <password>");
     println!("  rustchain-cli tx sign-demo [amount]");
     println!("  rustchain-cli chain info");
+    println!("  rustchain-cli chain blocks [from_height] [limit]");
     println!("  rustchain-cli chain block <height>");
     println!("  rustchain-cli chain mempool [limit]");
     println!("  rustchain-cli chain balance <address>");

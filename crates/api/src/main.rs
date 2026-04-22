@@ -169,6 +169,15 @@ struct ChainMempoolQuery {
     limit: Option<usize>,
 }
 
+/// 区块列表查询参数。
+#[derive(Debug, Default, Deserialize)]
+struct ChainBlocksQuery {
+    /// 起始高度（包含），默认 0。
+    from_height: Option<u64>,
+    /// 可选返回条数上限（1~200），默认 20。
+    limit: Option<usize>,
+}
+
 /// 创建钱包接口（原型阶段同时返回密钥对用于学习调试）。
 async fn wallet_create_handler(
     Json(payload): Json<CreateWalletRequest>,
@@ -325,6 +334,7 @@ fn build_app(shared_state: AppState) -> Router {
         .route("/p2p/peer/register", post(p2p_register_peer_handler))
         .route("/p2p/message", post(p2p_message_handler))
         .route("/chain/info", get(chain_info_handler))
+        .route("/chain/blocks", get(chain_blocks_handler))
         .route("/chain/block/:height", get(chain_block_by_height_handler))
         .route("/chain/mempool", get(chain_mempool_handler))
         .route("/chain/balance/:address", get(chain_balance_handler))
@@ -728,6 +738,49 @@ async fn chain_block_by_height_handler(
             Json(json!({
                 "ok": false,
                 "error": format!("高度为 {height} 的区块不存在")
+            })),
+        ),
+        Err((status, body)) => (status, Json(body)),
+    }
+}
+
+/// 按区间查询区块列表接口。
+async fn chain_blocks_handler(
+    State(state): State<AppState>,
+    Query(query): Query<ChainBlocksQuery>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let from_height = query.from_height.unwrap_or(0);
+    let limit = query.limit.unwrap_or(20);
+    if limit == 0 || limit > 200 {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "ok": false,
+                "error": "limit 必须在 1~200 之间"
+            })),
+        );
+    }
+
+    match with_chain(&state, |chain| {
+        let latest = chain.latest_block()?.index;
+        let blocks = chain
+            .chain
+            .iter()
+            .filter(|block| block.index >= from_height)
+            .take(limit)
+            .cloned()
+            .collect::<Vec<_>>();
+        Ok((latest, blocks))
+    }) {
+        Ok((latest_height, blocks)) => (
+            StatusCode::OK,
+            Json(json!({
+                "ok": true,
+                "from_height": from_height,
+                "limit": limit,
+                "latest_height": latest_height,
+                "returned_count": blocks.len(),
+                "blocks": blocks
             })),
         ),
         Err((status, body)) => (status, Json(body)),
@@ -2385,6 +2438,54 @@ mod tests {
         let app = build_test_app();
         let (status, body) = send_empty(&app, Method::GET, "/chain/block/99").await;
         assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(body["ok"], json!(false));
+    }
+
+    /// 验证可按区间查询区块列表。
+    #[tokio::test]
+    async fn chain_blocks_should_support_from_height_and_limit() {
+        let app = build_test_app();
+
+        let _ = send_json(
+            &app,
+            Method::POST,
+            "/chain/mine",
+            json!({ "miner_address": "miner-range-1" }),
+        )
+        .await;
+        let _ = send_json(
+            &app,
+            Method::POST,
+            "/chain/mine",
+            json!({ "miner_address": "miner-range-2" }),
+        )
+        .await;
+        let _ = send_json(
+            &app,
+            Method::POST,
+            "/chain/mine",
+            json!({ "miner_address": "miner-range-3" }),
+        )
+        .await;
+
+        let (status, body) =
+            send_empty(&app, Method::GET, "/chain/blocks?from_height=1&limit=2").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["ok"], json!(true));
+        assert_eq!(body["returned_count"], json!(2));
+
+        let blocks = body["blocks"].as_array().expect("blocks 应为数组");
+        assert_eq!(blocks.len(), 2);
+        assert_eq!(blocks[0]["index"], json!(1));
+        assert_eq!(blocks[1]["index"], json!(2));
+    }
+
+    /// 验证区块列表查询 limit=0 会被拒绝。
+    #[tokio::test]
+    async fn chain_blocks_with_zero_limit_should_fail() {
+        let app = build_test_app();
+        let (status, body) = send_empty(&app, Method::GET, "/chain/blocks?limit=0").await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
         assert_eq!(body["ok"], json!(false));
     }
 
