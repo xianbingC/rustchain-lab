@@ -334,6 +334,7 @@ fn build_app(shared_state: AppState) -> Router {
         .route("/p2p/peer/register", post(p2p_register_peer_handler))
         .route("/p2p/message", post(p2p_message_handler))
         .route("/chain/info", get(chain_info_handler))
+        .route("/chain/validate", get(chain_validate_handler))
         .route("/chain/block/latest", get(chain_latest_block_handler))
         .route("/chain/blocks", get(chain_blocks_handler))
         .route("/chain/block/:height", get(chain_block_by_height_handler))
@@ -755,6 +756,25 @@ async fn chain_latest_block_handler(
             Json(json!({
                 "ok": true,
                 "block": block
+            })),
+        ),
+        Err((status, body)) => (status, Json(body)),
+    }
+}
+
+/// 链完整性校验接口。
+async fn chain_validate_handler(
+    State(state): State<AppState>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    match with_chain(&state, |chain| {
+        chain.validate_chain()?;
+        Ok(())
+    }) {
+        Ok(()) => (
+            StatusCode::OK,
+            Json(json!({
+                "ok": true,
+                "valid": true
             })),
         ),
         Err((status, body)) => (status, Json(body)),
@@ -2530,6 +2550,25 @@ mod tests {
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body["ok"], json!(true));
         assert_eq!(body["block"]["index"], json!(2));
+    }
+
+    /// 验证链完整性校验接口可返回通过结果。
+    #[tokio::test]
+    async fn chain_validate_should_return_valid() {
+        let app = build_test_app();
+
+        let _ = send_json(
+            &app,
+            Method::POST,
+            "/chain/mine",
+            json!({ "miner_address": "validate-miner" }),
+        )
+        .await;
+
+        let (status, body) = send_empty(&app, Method::GET, "/chain/validate").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["ok"], json!(true));
+        assert_eq!(body["valid"], json!(true));
     }
 
     /// 验证 P2P 节点注册与 Ping/Pong 消息处理流程。

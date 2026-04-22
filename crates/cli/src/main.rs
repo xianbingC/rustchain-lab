@@ -161,7 +161,7 @@ fn run_sign_demo(args: &[String]) -> AppResult<()> {
 fn handle_chain_command(config: &AppConfig, args: &[String]) -> AppResult<()> {
     if args.len() < 2 {
         return Err(AppError::Command(
-            "chain 命令缺少子命令，可用: info/latest-block/head/blocks/block/mempool/balance/contract-state/contract-events/contract-field/mine/transfer/contract-call-file/history-block/history-tx"
+            "chain 命令缺少子命令，可用: info/validate/latest-block/head/blocks/block/mempool/balance/contract-state/contract-events/contract-field/mine/transfer/contract-call-file/history-block/history-tx"
                 .to_string(),
         ));
     }
@@ -170,6 +170,10 @@ fn handle_chain_command(config: &AppConfig, args: &[String]) -> AppResult<()> {
         "info" => {
             let response = call_api_json(config, Method::GET, "/chain/info", None)?;
             print_json("chain_info", response)
+        }
+        "validate" => {
+            let response = call_api_json(config, Method::GET, "/chain/validate", None)?;
+            print_json("chain_validate", response)
         }
         "latest-block" => {
             let response = call_api_json(config, Method::GET, "/chain/block/latest", None)?;
@@ -907,6 +911,7 @@ fn print_help() {
     println!("  rustchain-cli wallet create <password>");
     println!("  rustchain-cli tx sign-demo [amount]");
     println!("  rustchain-cli chain info");
+    println!("  rustchain-cli chain validate");
     println!("  rustchain-cli chain latest-block");
     println!("  rustchain-cli chain head [count]");
     println!("  rustchain-cli chain blocks [from_height] [limit]");
