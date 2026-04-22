@@ -161,7 +161,7 @@ fn run_sign_demo(args: &[String]) -> AppResult<()> {
 fn handle_chain_command(config: &AppConfig, args: &[String]) -> AppResult<()> {
     if args.len() < 2 {
         return Err(AppError::Command(
-            "chain 命令缺少子命令，可用: info/mempool/balance/contract-state/contract-events/contract-field/mine/transfer/contract-call-file/history-block/history-tx"
+            "chain 命令缺少子命令，可用: info/block/mempool/balance/contract-state/contract-events/contract-field/mine/transfer/contract-call-file/history-block/history-tx"
                 .to_string(),
         ));
     }
@@ -170,6 +170,12 @@ fn handle_chain_command(config: &AppConfig, args: &[String]) -> AppResult<()> {
         "info" => {
             let response = call_api_json(config, Method::GET, "/chain/info", None)?;
             print_json("chain_info", response)
+        }
+        "block" => {
+            let height = parse_u64_arg(args, 2, "height")?;
+            let path = format!("/chain/block/{height}");
+            let response = call_api_json(config, Method::GET, &path, None)?;
+            print_json("chain_block", response)
         }
         "mempool" => {
             let path = match args.get(2) {
@@ -830,6 +836,7 @@ fn print_help() {
     println!("  rustchain-cli wallet create <password>");
     println!("  rustchain-cli tx sign-demo [amount]");
     println!("  rustchain-cli chain info");
+    println!("  rustchain-cli chain block <height>");
     println!("  rustchain-cli chain mempool [limit]");
     println!("  rustchain-cli chain balance <address>");
     println!("  rustchain-cli chain contract-state <address>");

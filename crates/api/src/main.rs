@@ -325,6 +325,7 @@ fn build_app(shared_state: AppState) -> Router {
         .route("/p2p/peer/register", post(p2p_register_peer_handler))
         .route("/p2p/message", post(p2p_message_handler))
         .route("/chain/info", get(chain_info_handler))
+        .route("/chain/block/:height", get(chain_block_by_height_handler))
         .route("/chain/mempool", get(chain_mempool_handler))
         .route("/chain/balance/:address", get(chain_balance_handler))
         .route(
@@ -699,6 +700,36 @@ async fn chain_info_handler(
         }))
     }) {
         Ok(body) => (StatusCode::OK, Json(body)),
+        Err((status, body)) => (status, Json(body)),
+    }
+}
+
+/// 按高度查询区块接口。
+async fn chain_block_by_height_handler(
+    State(state): State<AppState>,
+    Path(height): Path<u64>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    match with_chain(&state, |chain| {
+        Ok(chain
+            .chain
+            .iter()
+            .find(|block| block.index == height)
+            .cloned())
+    }) {
+        Ok(Some(block)) => (
+            StatusCode::OK,
+            Json(json!({
+                "ok": true,
+                "block": block
+            })),
+        ),
+        Ok(None) => (
+            StatusCode::NOT_FOUND,
+            Json(json!({
+                "ok": false,
+                "error": format!("高度为 {height} 的区块不存在")
+            })),
+        ),
         Err((status, body)) => (status, Json(body)),
     }
 }
@@ -2326,6 +2357,34 @@ mod tests {
         let app = build_test_app();
         let (status, body) = send_empty(&app, Method::GET, "/chain/mempool?limit=0").await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["ok"], json!(false));
+    }
+
+    /// 验证可按高度查询区块详情。
+    #[tokio::test]
+    async fn chain_block_by_height_should_return_block() {
+        let app = build_test_app();
+
+        let _ = send_json(
+            &app,
+            Method::POST,
+            "/chain/mine",
+            json!({ "miner_address": "miner-by-height" }),
+        )
+        .await;
+
+        let (status, body) = send_empty(&app, Method::GET, "/chain/block/1").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["ok"], json!(true));
+        assert_eq!(body["block"]["index"], json!(1));
+    }
+
+    /// 验证查询不存在高度时返回 404。
+    #[tokio::test]
+    async fn chain_block_by_height_not_found_should_return_404() {
+        let app = build_test_app();
+        let (status, body) = send_empty(&app, Method::GET, "/chain/block/99").await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
         assert_eq!(body["ok"], json!(false));
     }
 
