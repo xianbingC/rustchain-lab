@@ -1,5 +1,5 @@
 use axum::{
-    extract::{Path, State},
+    extract::{Path, Query, State},
     http::StatusCode,
     routing::{get, post},
     Json, Router,
@@ -162,6 +162,13 @@ struct ChainInfoResponse {
     peer_count: usize,
 }
 
+/// 交易池查询参数。
+#[derive(Debug, Default, Deserialize)]
+struct ChainMempoolQuery {
+    /// 可选返回条数上限（>0）。
+    limit: Option<usize>,
+}
+
 /// 创建钱包接口（原型阶段同时返回密钥对用于学习调试）。
 async fn wallet_create_handler(
     Json(payload): Json<CreateWalletRequest>,
@@ -318,6 +325,7 @@ fn build_app(shared_state: AppState) -> Router {
         .route("/p2p/peer/register", post(p2p_register_peer_handler))
         .route("/p2p/message", post(p2p_message_handler))
         .route("/chain/info", get(chain_info_handler))
+        .route("/chain/mempool", get(chain_mempool_handler))
         .route("/chain/balance/:address", get(chain_balance_handler))
         .route(
             "/chain/contract/:address/state",
@@ -691,6 +699,47 @@ async fn chain_info_handler(
         }))
     }) {
         Ok(body) => (StatusCode::OK, Json(body)),
+        Err((status, body)) => (status, Json(body)),
+    }
+}
+
+/// 交易池查询接口。
+async fn chain_mempool_handler(
+    State(state): State<AppState>,
+    Query(query): Query<ChainMempoolQuery>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    if matches!(query.limit, Some(0)) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "ok": false,
+                "error": "limit 必须大于 0"
+            })),
+        );
+    }
+
+    match with_chain(&state, |chain| {
+        let total = chain.pending_transactions.len();
+        let transactions = match query.limit {
+            Some(limit) => chain
+                .pending_transactions
+                .iter()
+                .take(limit)
+                .cloned()
+                .collect(),
+            None => chain.pending_transactions.clone(),
+        };
+        Ok((total, transactions))
+    }) {
+        Ok((total, transactions)) => (
+            StatusCode::OK,
+            Json(json!({
+                "ok": true,
+                "total_pending_tx_count": total,
+                "returned_count": transactions.len(),
+                "transactions": transactions
+            })),
+        ),
         Err((status, body)) => (status, Json(body)),
     }
 }
@@ -2190,6 +2239,94 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body["balance"], json!(20));
+    }
+
+    /// 验证交易池查询支持返回完整列表和 limit 截断。
+    #[tokio::test]
+    async fn chain_mempool_should_support_limit_query() {
+        let app = build_test_app();
+        let (alice_wallet, alice_key_pair) = create_wallet("alice-pass").expect("创建钱包应成功");
+        let (bob_wallet, _) = create_wallet("bob-pass").expect("创建钱包应成功");
+
+        let _ = send_json(
+            &app,
+            Method::POST,
+            "/chain/mine",
+            json!({ "miner_address": alice_wallet.address.clone() }),
+        )
+        .await;
+
+        let mut tx1 = Transaction::new(
+            alice_wallet.address.clone(),
+            bob_wallet.address.clone(),
+            10,
+            Some(b"mempool-test-1".to_vec()),
+        );
+        tx1.sign_with_private_key(&alice_key_pair.private_key, &alice_key_pair.public_key)
+            .expect("签名应成功");
+        let tx1_id = tx1.id.clone();
+
+        let mut tx2 = Transaction::new(
+            alice_wallet.address.clone(),
+            bob_wallet.address.clone(),
+            5,
+            Some(b"mempool-test-2".to_vec()),
+        );
+        tx2.sign_with_private_key(&alice_key_pair.private_key, &alice_key_pair.public_key)
+            .expect("签名应成功");
+        let tx2_id = tx2.id.clone();
+
+        let _ = send_json(
+            &app,
+            Method::POST,
+            "/chain/tx",
+            json!({ "transaction": tx1 }),
+        )
+        .await;
+        let _ = send_json(
+            &app,
+            Method::POST,
+            "/chain/tx",
+            json!({ "transaction": tx2 }),
+        )
+        .await;
+
+        let (status, body) = send_empty(&app, Method::GET, "/chain/mempool").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["total_pending_tx_count"], json!(2));
+        assert_eq!(body["returned_count"], json!(2));
+
+        let all_txs = body["transactions"]
+            .as_array()
+            .expect("transactions 应为数组");
+        assert_eq!(all_txs.len(), 2);
+        let all_ids = all_txs
+            .iter()
+            .filter_map(|tx| tx["id"].as_str())
+            .collect::<Vec<_>>();
+        assert!(all_ids.contains(&tx1_id.as_str()));
+        assert!(all_ids.contains(&tx2_id.as_str()));
+
+        let (status, body) = send_empty(&app, Method::GET, "/chain/mempool?limit=1").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["total_pending_tx_count"], json!(2));
+        assert_eq!(body["returned_count"], json!(1));
+        assert_eq!(
+            body["transactions"]
+                .as_array()
+                .expect("transactions 应为数组")
+                .len(),
+            1
+        );
+    }
+
+    /// 验证交易池查询 limit=0 会被拒绝。
+    #[tokio::test]
+    async fn chain_mempool_with_zero_limit_should_fail() {
+        let app = build_test_app();
+        let (status, body) = send_empty(&app, Method::GET, "/chain/mempool?limit=0").await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["ok"], json!(false));
     }
 
     /// 验证 P2P 节点注册与 Ping/Pong 消息处理流程。

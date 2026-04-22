@@ -161,7 +161,7 @@ fn run_sign_demo(args: &[String]) -> AppResult<()> {
 fn handle_chain_command(config: &AppConfig, args: &[String]) -> AppResult<()> {
     if args.len() < 2 {
         return Err(AppError::Command(
-            "chain 命令缺少子命令，可用: info/balance/contract-state/contract-events/contract-field/mine/transfer/contract-call-file/history-block/history-tx"
+            "chain 命令缺少子命令，可用: info/mempool/balance/contract-state/contract-events/contract-field/mine/transfer/contract-call-file/history-block/history-tx"
                 .to_string(),
         ));
     }
@@ -170,6 +170,22 @@ fn handle_chain_command(config: &AppConfig, args: &[String]) -> AppResult<()> {
         "info" => {
             let response = call_api_json(config, Method::GET, "/chain/info", None)?;
             print_json("chain_info", response)
+        }
+        "mempool" => {
+            let path = match args.get(2) {
+                Some(raw_limit) => {
+                    let limit = raw_limit.parse::<usize>().map_err(|error| {
+                        AppError::Command(format!("limit 参数解析失败: {error}"))
+                    })?;
+                    if limit == 0 {
+                        return Err(AppError::Command("limit 必须大于 0".to_string()));
+                    }
+                    format!("/chain/mempool?limit={limit}")
+                }
+                None => "/chain/mempool".to_string(),
+            };
+            let response = call_api_json(config, Method::GET, &path, None)?;
+            print_json("chain_mempool", response)
         }
         "balance" => {
             let address = require_arg(args, 2, "address")?;
@@ -814,6 +830,7 @@ fn print_help() {
     println!("  rustchain-cli wallet create <password>");
     println!("  rustchain-cli tx sign-demo [amount]");
     println!("  rustchain-cli chain info");
+    println!("  rustchain-cli chain mempool [limit]");
     println!("  rustchain-cli chain balance <address>");
     println!("  rustchain-cli chain contract-state <address>");
     println!("  rustchain-cli chain contract-events <address>");
