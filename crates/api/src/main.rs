@@ -334,6 +334,7 @@ fn build_app(shared_state: AppState) -> Router {
         .route("/p2p/peer/register", post(p2p_register_peer_handler))
         .route("/p2p/message", post(p2p_message_handler))
         .route("/chain/info", get(chain_info_handler))
+        .route("/chain/block/latest", get(chain_latest_block_handler))
         .route("/chain/blocks", get(chain_blocks_handler))
         .route("/chain/block/:height", get(chain_block_by_height_handler))
         .route("/chain/mempool", get(chain_mempool_handler))
@@ -738,6 +739,22 @@ async fn chain_block_by_height_handler(
             Json(json!({
                 "ok": false,
                 "error": format!("高度为 {height} 的区块不存在")
+            })),
+        ),
+        Err((status, body)) => (status, Json(body)),
+    }
+}
+
+/// 查询最新区块详情接口。
+async fn chain_latest_block_handler(
+    State(state): State<AppState>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    match with_chain(&state, |chain| Ok(chain.latest_block()?.clone())) {
+        Ok(block) => (
+            StatusCode::OK,
+            Json(json!({
+                "ok": true,
+                "block": block
             })),
         ),
         Err((status, body)) => (status, Json(body)),
@@ -2487,6 +2504,32 @@ mod tests {
         let (status, body) = send_empty(&app, Method::GET, "/chain/blocks?limit=0").await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert_eq!(body["ok"], json!(false));
+    }
+
+    /// 验证可查询最新区块详情。
+    #[tokio::test]
+    async fn chain_latest_block_should_return_latest() {
+        let app = build_test_app();
+
+        let _ = send_json(
+            &app,
+            Method::POST,
+            "/chain/mine",
+            json!({ "miner_address": "latest-miner-a" }),
+        )
+        .await;
+        let _ = send_json(
+            &app,
+            Method::POST,
+            "/chain/mine",
+            json!({ "miner_address": "latest-miner-b" }),
+        )
+        .await;
+
+        let (status, body) = send_empty(&app, Method::GET, "/chain/block/latest").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["ok"], json!(true));
+        assert_eq!(body["block"]["index"], json!(2));
     }
 
     /// 验证 P2P 节点注册与 Ping/Pong 消息处理流程。

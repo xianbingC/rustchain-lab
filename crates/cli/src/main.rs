@@ -161,7 +161,7 @@ fn run_sign_demo(args: &[String]) -> AppResult<()> {
 fn handle_chain_command(config: &AppConfig, args: &[String]) -> AppResult<()> {
     if args.len() < 2 {
         return Err(AppError::Command(
-            "chain 命令缺少子命令，可用: info/blocks/block/mempool/balance/contract-state/contract-events/contract-field/mine/transfer/contract-call-file/history-block/history-tx"
+            "chain 命令缺少子命令，可用: info/latest-block/head/blocks/block/mempool/balance/contract-state/contract-events/contract-field/mine/transfer/contract-call-file/history-block/history-tx"
                 .to_string(),
         ));
     }
@@ -170,6 +170,30 @@ fn handle_chain_command(config: &AppConfig, args: &[String]) -> AppResult<()> {
         "info" => {
             let response = call_api_json(config, Method::GET, "/chain/info", None)?;
             print_json("chain_info", response)
+        }
+        "latest-block" => {
+            let response = call_api_json(config, Method::GET, "/chain/block/latest", None)?;
+            print_json("chain_latest_block", response)
+        }
+        "head" => {
+            let count = args
+                .get(2)
+                .map(|raw| {
+                    raw.parse::<usize>()
+                        .map_err(|error| AppError::Command(format!("count 参数解析失败: {error}")))
+                })
+                .transpose()?
+                .unwrap_or(10);
+            if count == 0 || count > 200 {
+                return Err(AppError::Command("count 必须在 1~200 之间".to_string()));
+            }
+
+            let chain_info = call_api_json(config, Method::GET, "/chain/info", None)?;
+            let latest_height = parse_chain_height(&chain_info)?;
+            let from_height = compute_head_from_height(latest_height, count);
+            let path = format!("/chain/blocks?from_height={from_height}&limit={count}");
+            let response = call_api_json(config, Method::GET, &path, None)?;
+            print_json("chain_head_blocks", response)
         }
         "blocks" => {
             let from_height = args
@@ -801,6 +825,18 @@ fn parse_u64_arg(args: &[String], index: usize, name: &str) -> AppResult<u64> {
         .map_err(|error| AppError::Command(format!("{name} 参数解析失败: {error}")))
 }
 
+/// 从链信息响应中提取最新高度。
+fn parse_chain_height(chain_info: &Value) -> AppResult<u64> {
+    chain_info["chain"]["height"]
+        .as_u64()
+        .ok_or_else(|| AppError::Command("chain.height 字段缺失或类型错误".to_string()))
+}
+
+/// 根据最新高度和数量，计算最近区块查询的起始高度（含）。
+fn compute_head_from_height(latest_height: u64, count: usize) -> u64 {
+    latest_height.saturating_add(1).saturating_sub(count as u64)
+}
+
 /// 构造并签名一笔转账交易，用于提交到链接口。
 fn build_signed_transfer_tx(
     from: &str,
@@ -871,6 +907,8 @@ fn print_help() {
     println!("  rustchain-cli wallet create <password>");
     println!("  rustchain-cli tx sign-demo [amount]");
     println!("  rustchain-cli chain info");
+    println!("  rustchain-cli chain latest-block");
+    println!("  rustchain-cli chain head [count]");
     println!("  rustchain-cli chain blocks [from_height] [limit]");
     println!("  rustchain-cli chain block <height>");
     println!("  rustchain-cli chain mempool [limit]");
@@ -921,10 +959,11 @@ fn print_help() {
 mod tests {
     use super::{
         api_base_url, build_signed_contract_call_tx, build_signed_transfer_tx,
-        read_contract_source, require_arg,
+        compute_head_from_height, parse_chain_height, read_contract_source, require_arg,
     };
     use rustchain_common::AppConfig;
     use rustchain_crypto::wallet::create_wallet;
+    use serde_json::json;
     use std::{fs, path::PathBuf};
 
     /// 验证 API 根地址组装正确。
@@ -1036,6 +1075,26 @@ mod tests {
         assert!(source.contains("LOAD_CONST 1"));
 
         let _ = fs::remove_file(path);
+    }
+
+    /// 验证最近区块查询起始高度计算逻辑。
+    #[test]
+    fn compute_head_from_height_should_work() {
+        assert_eq!(compute_head_from_height(20, 5), 16);
+        assert_eq!(compute_head_from_height(2, 10), 0);
+    }
+
+    /// 验证能从链信息响应中提取最新高度。
+    #[test]
+    fn parse_chain_height_should_work() {
+        let chain_info = json!({
+            "ok": true,
+            "chain": {
+                "height": 18
+            }
+        });
+        let height = parse_chain_height(&chain_info).expect("解析高度应成功");
+        assert_eq!(height, 18);
     }
 
     /// 生成测试临时文件路径。
