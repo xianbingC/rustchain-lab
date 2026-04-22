@@ -167,6 +167,8 @@ struct ChainInfoResponse {
 struct ChainMempoolQuery {
     /// 可选返回条数上限（>0）。
     limit: Option<usize>,
+    /// 可选地址过滤（匹配 from 或 to）。
+    address: Option<String>,
 }
 
 /// 区块列表查询参数。
@@ -838,25 +840,42 @@ async fn chain_mempool_handler(
             })),
         );
     }
+    if matches!(query.address.as_ref(), Some(address) if address.trim().is_empty()) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "ok": false,
+                "error": "address 不能为空"
+            })),
+        );
+    }
 
     match with_chain(&state, |chain| {
         let total = chain.pending_transactions.len();
+        let filter_address = query.address.as_ref().map(|address| address.trim());
+        let filtered = chain
+            .pending_transactions
+            .iter()
+            .filter(|tx| match filter_address {
+                Some(address) => tx.from == address || tx.to == address,
+                None => true,
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        let matched_count = filtered.len();
         let transactions = match query.limit {
-            Some(limit) => chain
-                .pending_transactions
-                .iter()
-                .take(limit)
-                .cloned()
-                .collect(),
-            None => chain.pending_transactions.clone(),
+            Some(limit) => filtered.into_iter().take(limit).collect(),
+            None => filtered,
         };
-        Ok((total, transactions))
+        Ok((total, matched_count, transactions))
     }) {
-        Ok((total, transactions)) => (
+        Ok((total, matched_count, transactions)) => (
             StatusCode::OK,
             Json(json!({
                 "ok": true,
                 "total_pending_tx_count": total,
+                "matched_count": matched_count,
+                "filter_address": query.address,
                 "returned_count": transactions.len(),
                 "transactions": transactions
             })),
@@ -2446,6 +2465,81 @@ mod tests {
     async fn chain_mempool_with_zero_limit_should_fail() {
         let app = build_test_app();
         let (status, body) = send_empty(&app, Method::GET, "/chain/mempool?limit=0").await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["ok"], json!(false));
+    }
+
+    /// 验证交易池查询支持按地址过滤（from/to 任一匹配）。
+    #[tokio::test]
+    async fn chain_mempool_should_support_address_filter() {
+        let app = build_test_app();
+        let (alice_wallet, alice_key_pair) = create_wallet("alice-pass").expect("创建钱包应成功");
+        let (carol_wallet, carol_key_pair) = create_wallet("carol-pass").expect("创建钱包应成功");
+        let (bob_wallet, _) = create_wallet("bob-pass").expect("创建钱包应成功");
+
+        let _ = send_json(
+            &app,
+            Method::POST,
+            "/chain/mine",
+            json!({ "miner_address": alice_wallet.address.clone() }),
+        )
+        .await;
+        let _ = send_json(
+            &app,
+            Method::POST,
+            "/chain/mine",
+            json!({ "miner_address": carol_wallet.address.clone() }),
+        )
+        .await;
+
+        let mut tx1 = Transaction::new(
+            alice_wallet.address.clone(),
+            bob_wallet.address.clone(),
+            8,
+            Some(b"mempool-filter-alice".to_vec()),
+        );
+        tx1.sign_with_private_key(&alice_key_pair.private_key, &alice_key_pair.public_key)
+            .expect("签名应成功");
+        let tx1_id = tx1.id.clone();
+
+        let mut tx2 = Transaction::new(
+            carol_wallet.address.clone(),
+            bob_wallet.address.clone(),
+            9,
+            Some(b"mempool-filter-carol".to_vec()),
+        );
+        tx2.sign_with_private_key(&carol_key_pair.private_key, &carol_key_pair.public_key)
+            .expect("签名应成功");
+
+        let _ = send_json(
+            &app,
+            Method::POST,
+            "/chain/tx",
+            json!({ "transaction": tx1 }),
+        )
+        .await;
+        let _ = send_json(
+            &app,
+            Method::POST,
+            "/chain/tx",
+            json!({ "transaction": tx2 }),
+        )
+        .await;
+
+        let path = format!("/chain/mempool?address={}", alice_wallet.address);
+        let (status, body) = send_empty(&app, Method::GET, &path).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["total_pending_tx_count"], json!(2));
+        assert_eq!(body["matched_count"], json!(1));
+        assert_eq!(body["returned_count"], json!(1));
+        assert_eq!(body["transactions"][0]["id"], json!(tx1_id));
+    }
+
+    /// 验证交易池地址过滤参数不能为空字符串。
+    #[tokio::test]
+    async fn chain_mempool_with_empty_address_should_fail() {
+        let app = build_test_app();
+        let (status, body) = send_empty(&app, Method::GET, "/chain/mempool?address=").await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert_eq!(body["ok"], json!(false));
     }

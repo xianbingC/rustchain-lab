@@ -241,17 +241,18 @@ fn handle_chain_command(config: &AppConfig, args: &[String]) -> AppResult<()> {
             print_json("chain_block", response)
         }
         "mempool" => {
-            let path = match args.get(2) {
-                Some(raw_limit) => {
-                    let limit = raw_limit.parse::<usize>().map_err(|error| {
-                        AppError::Command(format!("limit 参数解析失败: {error}"))
-                    })?;
-                    if limit == 0 {
-                        return Err(AppError::Command("limit 必须大于 0".to_string()));
-                    }
-                    format!("/chain/mempool?limit={limit}")
-                }
-                None => "/chain/mempool".to_string(),
+            let (limit, address) = parse_mempool_args(args)?;
+            let mut query_pairs = Vec::new();
+            if let Some(limit) = limit {
+                query_pairs.push(format!("limit={limit}"));
+            }
+            if let Some(address) = address {
+                query_pairs.push(format!("address={address}"));
+            }
+            let path = if query_pairs.is_empty() {
+                "/chain/mempool".to_string()
+            } else {
+                format!("/chain/mempool?{}", query_pairs.join("&"))
             };
             let response = call_api_json(config, Method::GET, &path, None)?;
             print_json("chain_mempool", response)
@@ -829,6 +830,42 @@ fn parse_u64_arg(args: &[String], index: usize, name: &str) -> AppResult<u64> {
         .map_err(|error| AppError::Command(format!("{name} 参数解析失败: {error}")))
 }
 
+/// 解析交易池查询参数，支持 [limit]、[address]、[limit] [address] 三种形态。
+fn parse_mempool_args(args: &[String]) -> AppResult<(Option<usize>, Option<String>)> {
+    let raw1 = args.get(2).map(|value| value.trim()).unwrap_or_default();
+    let raw2 = args.get(3).map(|value| value.trim()).unwrap_or_default();
+
+    if raw1.is_empty() && raw2.is_empty() {
+        return Ok((None, None));
+    }
+    if raw1.is_empty() && !raw2.is_empty() {
+        return Err(AppError::Command(
+            "mempool 参数错误：address 需要放在 limit 之后或单独作为第一个参数".to_string(),
+        ));
+    }
+
+    let parsed_limit = raw1.parse::<usize>();
+    if let Ok(limit) = parsed_limit {
+        if limit == 0 {
+            return Err(AppError::Command("limit 必须大于 0".to_string()));
+        }
+        let address = if raw2.is_empty() {
+            None
+        } else {
+            Some(raw2.to_string())
+        };
+        return Ok((Some(limit), address));
+    }
+
+    if !raw2.is_empty() {
+        return Err(AppError::Command(
+            "mempool 参数错误：当提供两个参数时，第一个必须是 limit".to_string(),
+        ));
+    }
+
+    Ok((None, Some(raw1.to_string())))
+}
+
 /// 从链信息响应中提取最新高度。
 fn parse_chain_height(chain_info: &Value) -> AppResult<u64> {
     chain_info["chain"]["height"]
@@ -916,7 +953,7 @@ fn print_help() {
     println!("  rustchain-cli chain head [count]");
     println!("  rustchain-cli chain blocks [from_height] [limit]");
     println!("  rustchain-cli chain block <height>");
-    println!("  rustchain-cli chain mempool [limit]");
+    println!("  rustchain-cli chain mempool [limit] [address]");
     println!("  rustchain-cli chain balance <address>");
     println!("  rustchain-cli chain contract-state <address>");
     println!("  rustchain-cli chain contract-events <address>");
@@ -964,7 +1001,8 @@ fn print_help() {
 mod tests {
     use super::{
         api_base_url, build_signed_contract_call_tx, build_signed_transfer_tx,
-        compute_head_from_height, parse_chain_height, read_contract_source, require_arg,
+        compute_head_from_height, parse_chain_height, parse_mempool_args, read_contract_source,
+        require_arg,
     };
     use rustchain_common::AppConfig;
     use rustchain_crypto::wallet::create_wallet;
@@ -1100,6 +1138,33 @@ mod tests {
         });
         let height = parse_chain_height(&chain_info).expect("解析高度应成功");
         assert_eq!(height, 18);
+    }
+
+    /// 验证交易池命令参数解析支持 limit/address 组合。
+    #[test]
+    fn parse_mempool_args_should_support_limit_and_address() {
+        let args = vec![
+            "chain".to_string(),
+            "mempool".to_string(),
+            "5".to_string(),
+            "addr-demo".to_string(),
+        ];
+        let (limit, address) = parse_mempool_args(&args).expect("参数解析应成功");
+        assert_eq!(limit, Some(5));
+        assert_eq!(address.as_deref(), Some("addr-demo"));
+    }
+
+    /// 验证交易池命令参数解析支持单独 address。
+    #[test]
+    fn parse_mempool_args_should_support_only_address() {
+        let args = vec![
+            "chain".to_string(),
+            "mempool".to_string(),
+            "addr-demo".to_string(),
+        ];
+        let (limit, address) = parse_mempool_args(&args).expect("参数解析应成功");
+        assert_eq!(limit, None);
+        assert_eq!(address.as_deref(), Some("addr-demo"));
     }
 
     /// 生成测试临时文件路径。
