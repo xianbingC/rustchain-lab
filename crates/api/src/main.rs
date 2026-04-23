@@ -340,6 +340,7 @@ fn build_app(shared_state: AppState) -> Router {
         .route("/chain/block/latest", get(chain_latest_block_handler))
         .route("/chain/blocks", get(chain_blocks_handler))
         .route("/chain/block/:height", get(chain_block_by_height_handler))
+        .route("/chain/pending-tx/:tx_id", get(chain_pending_tx_handler))
         .route("/chain/mempool", get(chain_mempool_handler))
         .route("/chain/balance/:address", get(chain_balance_handler))
         .route(
@@ -878,6 +879,46 @@ async fn chain_mempool_handler(
                 "filter_address": query.address,
                 "returned_count": transactions.len(),
                 "transactions": transactions
+            })),
+        ),
+        Err((status, body)) => (status, Json(body)),
+    }
+}
+
+/// 按交易 ID 查询待打包交易详情。
+async fn chain_pending_tx_handler(
+    State(state): State<AppState>,
+    Path(tx_id): Path<String>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    if tx_id.trim().is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "ok": false,
+                "error": "tx_id 不能为空"
+            })),
+        );
+    }
+
+    match with_chain(&state, |chain| {
+        Ok(chain
+            .pending_transactions
+            .iter()
+            .find(|tx| tx.id == tx_id)
+            .cloned())
+    }) {
+        Ok(Some(transaction)) => (
+            StatusCode::OK,
+            Json(json!({
+                "ok": true,
+                "transaction": transaction
+            })),
+        ),
+        Ok(None) => (
+            StatusCode::NOT_FOUND,
+            Json(json!({
+                "ok": false,
+                "error": format!("待打包交易不存在: {tx_id}")
             })),
         ),
         Err((status, body)) => (status, Json(body)),
@@ -2541,6 +2582,55 @@ mod tests {
         let app = build_test_app();
         let (status, body) = send_empty(&app, Method::GET, "/chain/mempool?address=").await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["ok"], json!(false));
+    }
+
+    /// 验证可按 tx_id 查询待打包交易详情。
+    #[tokio::test]
+    async fn chain_pending_tx_should_return_transaction() {
+        let app = build_test_app();
+        let (alice_wallet, alice_key_pair) = create_wallet("alice-pass").expect("创建钱包应成功");
+        let (bob_wallet, _) = create_wallet("bob-pass").expect("创建钱包应成功");
+
+        let _ = send_json(
+            &app,
+            Method::POST,
+            "/chain/mine",
+            json!({ "miner_address": alice_wallet.address.clone() }),
+        )
+        .await;
+
+        let mut tx = Transaction::new(
+            alice_wallet.address.clone(),
+            bob_wallet.address.clone(),
+            11,
+            Some(b"pending-tx-query".to_vec()),
+        );
+        tx.sign_with_private_key(&alice_key_pair.private_key, &alice_key_pair.public_key)
+            .expect("签名应成功");
+        let tx_id = tx.id.clone();
+
+        let _ = send_json(
+            &app,
+            Method::POST,
+            "/chain/tx",
+            json!({ "transaction": tx }),
+        )
+        .await;
+
+        let path = format!("/chain/pending-tx/{tx_id}");
+        let (status, body) = send_empty(&app, Method::GET, &path).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["ok"], json!(true));
+        assert_eq!(body["transaction"]["id"], json!(tx_id));
+    }
+
+    /// 验证查询不存在的待打包交易返回 404。
+    #[tokio::test]
+    async fn chain_pending_tx_not_found_should_return_404() {
+        let app = build_test_app();
+        let (status, body) = send_empty(&app, Method::GET, "/chain/pending-tx/tx-missing").await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
         assert_eq!(body["ok"], json!(false));
     }
 
