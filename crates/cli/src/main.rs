@@ -161,7 +161,7 @@ fn run_sign_demo(args: &[String]) -> AppResult<()> {
 fn handle_chain_command(config: &AppConfig, args: &[String]) -> AppResult<()> {
     if args.len() < 2 {
         return Err(AppError::Command(
-            "chain 命令缺少子命令，可用: info/validate/latest-block/head/blocks/block/tx/pending-tx/mempool/balance/contract-state/contract-events/contract-field/mine/transfer/contract-call-file/history-block/history-tx"
+            "chain 命令缺少子命令，可用: info/validate/latest-block/head/blocks/block/address-txs/tx/pending-tx/mempool/balance/contract-state/contract-events/contract-field/mine/transfer/contract-call-file/history-block/history-tx"
                 .to_string(),
         ));
     }
@@ -239,6 +239,27 @@ fn handle_chain_command(config: &AppConfig, args: &[String]) -> AppResult<()> {
             let path = format!("/chain/block/{height}");
             let response = call_api_json(config, Method::GET, &path, None)?;
             print_json("chain_block", response)
+        }
+        "address-txs" => {
+            let address = require_arg(args, 2, "address")?;
+            let limit = args
+                .get(3)
+                .map(|raw| {
+                    raw.parse::<usize>()
+                        .map_err(|error| AppError::Command(format!("limit 参数解析失败: {error}")))
+                })
+                .transpose()?;
+            if let Some(limit) = limit {
+                if limit == 0 || limit > 200 {
+                    return Err(AppError::Command("limit 必须在 1~200 之间".to_string()));
+                }
+            }
+            let path = match limit {
+                Some(limit) => format!("/chain/address/{address}/txs?limit={limit}"),
+                None => format!("/chain/address/{address}/txs"),
+            };
+            let response = call_api_json(config, Method::GET, &path, None)?;
+            print_json("chain_address_txs", response)
         }
         "tx" => {
             let tx_id = require_arg(args, 2, "tx_id")?;
@@ -965,6 +986,7 @@ fn print_help() {
     println!("  rustchain-cli chain head [count]");
     println!("  rustchain-cli chain blocks [from_height] [limit]");
     println!("  rustchain-cli chain block <height>");
+    println!("  rustchain-cli chain address-txs <address> [limit]");
     println!("  rustchain-cli chain tx <tx_id>");
     println!("  rustchain-cli chain pending-tx <tx_id>");
     println!("  rustchain-cli chain mempool [limit] [address]");

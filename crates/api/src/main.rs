@@ -180,6 +180,24 @@ struct ChainBlocksQuery {
     limit: Option<usize>,
 }
 
+/// 地址交易查询参数。
+#[derive(Debug, Default, Deserialize)]
+struct ChainAddressTxsQuery {
+    /// 可选返回条数上限（1~200），默认 20。
+    limit: Option<usize>,
+}
+
+/// 地址交易查询项。
+#[derive(Debug, Clone, Serialize)]
+struct ChainAddressTxRecord {
+    /// 所在区块高度。
+    block_index: u64,
+    /// 所在区块哈希。
+    block_hash: String,
+    /// 交易详情。
+    transaction: Transaction,
+}
+
 /// 创建钱包接口（原型阶段同时返回密钥对用于学习调试）。
 async fn wallet_create_handler(
     Json(payload): Json<CreateWalletRequest>,
@@ -340,6 +358,10 @@ fn build_app(shared_state: AppState) -> Router {
         .route("/chain/block/latest", get(chain_latest_block_handler))
         .route("/chain/blocks", get(chain_blocks_handler))
         .route("/chain/block/:height", get(chain_block_by_height_handler))
+        .route(
+            "/chain/address/:address/txs",
+            get(chain_address_txs_handler),
+        )
         .route("/chain/pending-tx/:tx_id", get(chain_pending_tx_handler))
         .route("/chain/tx/:tx_id", get(chain_tx_query_handler))
         .route("/chain/mempool", get(chain_mempool_handler))
@@ -920,6 +942,68 @@ async fn chain_pending_tx_handler(
             Json(json!({
                 "ok": false,
                 "error": format!("待打包交易不存在: {tx_id}")
+            })),
+        ),
+        Err((status, body)) => (status, Json(body)),
+    }
+}
+
+/// 按地址查询已确认交易列表（from/to 任一匹配）。
+async fn chain_address_txs_handler(
+    State(state): State<AppState>,
+    Path(address): Path<String>,
+    Query(query): Query<ChainAddressTxsQuery>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    if address.trim().is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "ok": false,
+                "error": "address 不能为空"
+            })),
+        );
+    }
+
+    let limit = query.limit.unwrap_or(20);
+    if limit == 0 || limit > 200 {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "ok": false,
+                "error": "limit 必须在 1~200 之间"
+            })),
+        );
+    }
+
+    match with_chain(&state, |chain| {
+        let mut records = Vec::new();
+        for block in chain.chain.iter().rev() {
+            for tx in &block.transactions {
+                if tx.from == address || tx.to == address {
+                    records.push(ChainAddressTxRecord {
+                        block_index: block.index,
+                        block_hash: block.hash.clone(),
+                        transaction: tx.clone(),
+                    });
+                }
+            }
+        }
+        let total = records.len();
+        let returned = if records.len() > limit {
+            records.into_iter().take(limit).collect::<Vec<_>>()
+        } else {
+            records
+        };
+        Ok((total, returned))
+    }) {
+        Ok((total, transactions)) => (
+            StatusCode::OK,
+            Json(json!({
+                "ok": true,
+                "address": address,
+                "total_count": total,
+                "returned_count": transactions.len(),
+                "transactions": transactions
             })),
         ),
         Err((status, body)) => (status, Json(body)),
@@ -2697,6 +2781,64 @@ mod tests {
         let app = build_test_app();
         let (status, body) = send_empty(&app, Method::GET, "/chain/pending-tx/tx-missing").await;
         assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(body["ok"], json!(false));
+    }
+
+    /// 验证可按地址查询已确认交易列表。
+    #[tokio::test]
+    async fn chain_address_txs_should_return_confirmed_transactions() {
+        let app = build_test_app();
+        let (alice_wallet, alice_key_pair) = create_wallet("alice-pass").expect("创建钱包应成功");
+        let (bob_wallet, _) = create_wallet("bob-pass").expect("创建钱包应成功");
+
+        let _ = send_json(
+            &app,
+            Method::POST,
+            "/chain/mine",
+            json!({ "miner_address": alice_wallet.address.clone() }),
+        )
+        .await;
+
+        let mut tx = Transaction::new(
+            alice_wallet.address.clone(),
+            bob_wallet.address.clone(),
+            12,
+            Some(b"address-txs-query".to_vec()),
+        );
+        tx.sign_with_private_key(&alice_key_pair.private_key, &alice_key_pair.public_key)
+            .expect("签名应成功");
+        let tx_id = tx.id.clone();
+
+        let _ = send_json(
+            &app,
+            Method::POST,
+            "/chain/tx",
+            json!({ "transaction": tx }),
+        )
+        .await;
+        let _ = send_json(
+            &app,
+            Method::POST,
+            "/chain/mine",
+            json!({ "miner_address": "collector-miner" }),
+        )
+        .await;
+
+        let path = format!("/chain/address/{}/txs", bob_wallet.address);
+        let (status, body) = send_empty(&app, Method::GET, &path).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["ok"], json!(true));
+        assert_eq!(body["returned_count"], json!(1));
+        assert_eq!(body["transactions"][0]["transaction"]["id"], json!(tx_id));
+    }
+
+    /// 验证地址交易查询 limit=0 会被拒绝。
+    #[tokio::test]
+    async fn chain_address_txs_with_zero_limit_should_fail() {
+        let app = build_test_app();
+        let (status, body) =
+            send_empty(&app, Method::GET, "/chain/address/alice/txs?limit=0").await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
         assert_eq!(body["ok"], json!(false));
     }
 
