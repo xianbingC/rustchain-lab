@@ -110,7 +110,7 @@ pub struct RocksDbStateStore {
 #[cfg(feature = "rocksdb-backend")]
 impl RocksDbStateStore {
     /// 打开或创建 RocksDB 状态库。
-    pub fn open(path: impl AsRef<std::path::Path>) -> StorageResult<Self> {
+    pub fn open(path: impl AsRef<std::path::Path>) -> Result<Self> {
         let mut options = rocksdb::Options::default();
         options.create_if_missing(true);
 

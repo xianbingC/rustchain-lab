@@ -18,8 +18,10 @@ use rustchain_p2p::{
 use rustchain_storage::{
     error::StorageError,
     history::{HistoryStore, LevelDbHistoryStore},
-    state::{InMemoryStateStore, StateStore},
+    state::StateStore,
 };
+#[cfg(any(test, not(feature = "rocksdb-backend")))]
+use rustchain_storage::state::InMemoryStateStore;
 use rustchain_vm::{
     compiler::{compile, CompileError},
     runtime::{Runtime, VmError},
