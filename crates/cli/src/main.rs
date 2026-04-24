@@ -248,13 +248,16 @@ fn handle_chain_command(config: &AppConfig, args: &[String]) -> AppResult<()> {
         }
         "address-txs" => {
             let address = require_arg(args, 2, "address")?;
-            let (limit, direction) = parse_address_txs_args(args)?;
+            let (limit, direction, offset) = parse_address_txs_args(args)?;
             let mut query_pairs = Vec::new();
             if let Some(limit) = limit {
                 query_pairs.push(format!("limit={limit}"));
             }
             if let Some(direction) = direction {
                 query_pairs.push(format!("direction={direction}"));
+            }
+            if let Some(offset) = offset {
+                query_pairs.push(format!("offset={offset}"));
             }
             let path = if query_pairs.is_empty() {
                 format!("/chain/address/{address}/txs")
@@ -266,13 +269,16 @@ fn handle_chain_command(config: &AppConfig, args: &[String]) -> AppResult<()> {
         }
         "address-pending-txs" => {
             let address = require_arg(args, 2, "address")?;
-            let (limit, direction) = parse_address_txs_args(args)?;
+            let (limit, direction, offset) = parse_address_txs_args(args)?;
             let mut query_pairs = Vec::new();
             if let Some(limit) = limit {
                 query_pairs.push(format!("limit={limit}"));
             }
             if let Some(direction) = direction {
                 query_pairs.push(format!("direction={direction}"));
+            }
+            if let Some(offset) = offset {
+                query_pairs.push(format!("offset={offset}"));
             }
             let path = if query_pairs.is_empty() {
                 format!("/chain/address/{address}/pending-txs")
@@ -923,17 +929,25 @@ fn parse_mempool_args(args: &[String]) -> AppResult<(Option<usize>, Option<Strin
     Ok((None, Some(raw1.to_string())))
 }
 
-/// 解析地址交易查询参数，支持 [limit]、[direction]、[limit] [direction]。
-fn parse_address_txs_args(args: &[String]) -> AppResult<(Option<usize>, Option<String>)> {
+/// 解析地址交易查询参数，支持 [limit]、[direction]、[limit] [offset]、[direction] [offset]、[limit] [direction] [offset]。
+fn parse_address_txs_args(
+    args: &[String],
+) -> AppResult<(Option<usize>, Option<String>, Option<usize>)> {
     let raw1 = args.get(3).map(|value| value.trim()).unwrap_or_default();
     let raw2 = args.get(4).map(|value| value.trim()).unwrap_or_default();
+    let raw3 = args.get(5).map(|value| value.trim()).unwrap_or_default();
 
-    if raw1.is_empty() && raw2.is_empty() {
-        return Ok((None, None));
+    if raw1.is_empty() && raw2.is_empty() && raw3.is_empty() {
+        return Ok((None, None, None));
     }
-    if raw1.is_empty() && !raw2.is_empty() {
+    if raw1.is_empty() && (!raw2.is_empty() || !raw3.is_empty()) {
         return Err(AppError::Command(
             "address-txs 参数错误：direction 需要放在 limit 之后或单独作为第一个参数".to_string(),
+        ));
+    }
+    if !raw3.is_empty() && raw2.is_empty() {
+        return Err(AppError::Command(
+            "address-txs 参数错误：offset 需要放在 direction 之后".to_string(),
         ));
     }
 
@@ -950,21 +964,51 @@ fn parse_address_txs_args(args: &[String]) -> AppResult<(Option<usize>, Option<S
         if limit == 0 || limit > 200 {
             return Err(AppError::Command("limit 必须在 1~200 之间".to_string()));
         }
-        let direction = if raw2.is_empty() {
-            None
+        let (direction, offset) = if raw2.is_empty() {
+            if raw3.is_empty() {
+                (None, None)
+            } else {
+                return Err(AppError::Command(
+                    "address-txs 参数错误：offset 需要放在 direction 之后".to_string(),
+                ));
+            }
+        } else if let Ok(offset_only) = raw2.parse::<usize>() {
+            if raw3.is_empty() {
+                (None, Some(offset_only))
+            } else {
+                return Err(AppError::Command(
+                    "address-txs 参数错误：当提供三个参数时，第二个必须是 direction".to_string(),
+                ));
+            }
         } else {
-            Some(parse_direction(raw2)?)
+            let direction = Some(parse_direction(raw2)?);
+            let offset =
+                if raw3.is_empty() {
+                    None
+                } else {
+                    Some(raw3.parse::<usize>().map_err(|error| {
+                        AppError::Command(format!("offset 参数解析失败: {error}"))
+                    })?)
+                };
+            (direction, offset)
         };
-        return Ok((Some(limit), direction));
+        return Ok((Some(limit), direction, offset));
     }
 
     if !raw2.is_empty() {
+        if raw3.is_empty() {
+            let direction = parse_direction(raw1)?;
+            let offset = raw2
+                .parse::<usize>()
+                .map_err(|error| AppError::Command(format!("offset 参数解析失败: {error}")))?;
+            return Ok((None, Some(direction), Some(offset)));
+        }
         return Err(AppError::Command(
-            "address-txs 参数错误：当提供两个参数时，第一个必须是 limit".to_string(),
+            "address-txs 参数错误：limit 缺失".to_string(),
         ));
     }
 
-    Ok((None, Some(parse_direction(raw1)?)))
+    Ok((None, Some(parse_direction(raw1)?), None))
 }
 
 /// 从链信息响应中提取最新高度。
@@ -1055,8 +1099,8 @@ fn print_help() {
     println!("  rustchain-cli chain blocks [from_height] [limit]");
     println!("  rustchain-cli chain block <height>");
     println!("  rustchain-cli chain address-summary <address>");
-    println!("  rustchain-cli chain address-txs <address> [limit] [direction]");
-    println!("  rustchain-cli chain address-pending-txs <address> [limit] [direction]");
+    println!("  rustchain-cli chain address-txs <address> [limit] [direction] [offset]");
+    println!("  rustchain-cli chain address-pending-txs <address> [limit] [direction] [offset]");
     println!("  rustchain-cli chain tx <tx_id>");
     println!("  rustchain-cli chain pending-tx <tx_id>");
     println!("  rustchain-cli chain mempool [limit] [address]");
@@ -1283,9 +1327,10 @@ mod tests {
             "5".to_string(),
             "out".to_string(),
         ];
-        let (limit, direction) = parse_address_txs_args(&args).expect("参数解析应成功");
+        let (limit, direction, offset) = parse_address_txs_args(&args).expect("参数解析应成功");
         assert_eq!(limit, Some(5));
         assert_eq!(direction.as_deref(), Some("out"));
+        assert_eq!(offset, None);
     }
 
     /// 验证地址交易参数解析支持单独 direction。
@@ -1297,9 +1342,59 @@ mod tests {
             "addr-demo".to_string(),
             "in".to_string(),
         ];
-        let (limit, direction) = parse_address_txs_args(&args).expect("参数解析应成功");
+        let (limit, direction, offset) = parse_address_txs_args(&args).expect("参数解析应成功");
         assert_eq!(limit, None);
         assert_eq!(direction.as_deref(), Some("in"));
+        assert_eq!(offset, None);
+    }
+
+    /// 验证地址交易参数解析支持 limit + offset。
+    #[test]
+    fn parse_address_txs_args_should_support_limit_and_offset() {
+        let args = vec![
+            "chain".to_string(),
+            "address-txs".to_string(),
+            "addr-demo".to_string(),
+            "5".to_string(),
+            "2".to_string(),
+        ];
+        let (limit, direction, offset) = parse_address_txs_args(&args).expect("参数解析应成功");
+        assert_eq!(limit, Some(5));
+        assert_eq!(direction, None);
+        assert_eq!(offset, Some(2));
+    }
+
+    /// 验证地址交易参数解析支持 direction + offset。
+    #[test]
+    fn parse_address_txs_args_should_support_direction_and_offset() {
+        let args = vec![
+            "chain".to_string(),
+            "address-txs".to_string(),
+            "addr-demo".to_string(),
+            "in".to_string(),
+            "3".to_string(),
+        ];
+        let (limit, direction, offset) = parse_address_txs_args(&args).expect("参数解析应成功");
+        assert_eq!(limit, None);
+        assert_eq!(direction.as_deref(), Some("in"));
+        assert_eq!(offset, Some(3));
+    }
+
+    /// 验证地址交易参数解析支持 limit + direction + offset。
+    #[test]
+    fn parse_address_txs_args_should_support_limit_direction_and_offset() {
+        let args = vec![
+            "chain".to_string(),
+            "address-txs".to_string(),
+            "addr-demo".to_string(),
+            "8".to_string(),
+            "all".to_string(),
+            "4".to_string(),
+        ];
+        let (limit, direction, offset) = parse_address_txs_args(&args).expect("参数解析应成功");
+        assert_eq!(limit, Some(8));
+        assert_eq!(direction.as_deref(), Some("all"));
+        assert_eq!(offset, Some(4));
     }
 
     /// 生成测试临时文件路径。

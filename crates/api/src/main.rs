@@ -187,6 +187,8 @@ struct ChainAddressTxsQuery {
     limit: Option<usize>,
     /// 方向过滤：all/in/out，默认 all。
     direction: Option<String>,
+    /// 偏移量（>=0），默认 0。
+    offset: Option<usize>,
 }
 
 /// 地址交易查询项。
@@ -1001,6 +1003,7 @@ async fn chain_address_txs_handler(
         .unwrap_or("all")
         .trim()
         .to_ascii_lowercase();
+    let offset = query.offset.unwrap_or(0);
     if direction != "all" && direction != "in" && direction != "out" {
         return (
             StatusCode::BAD_REQUEST,
@@ -1057,11 +1060,11 @@ async fn chain_address_txs_handler(
             }
         }
         let total = records.len();
-        let returned = if records.len() > limit {
-            records.into_iter().take(limit).collect::<Vec<_>>()
-        } else {
-            records
-        };
+        let returned = records
+            .into_iter()
+            .skip(offset)
+            .take(limit)
+            .collect::<Vec<_>>();
         Ok((total, returned))
     }) {
         Ok((total, transactions)) => (
@@ -1070,6 +1073,7 @@ async fn chain_address_txs_handler(
                 "ok": true,
                 "address": address,
                 "direction": direction,
+                "offset": offset,
                 "total_count": total,
                 "returned_count": transactions.len(),
                 "transactions": transactions
@@ -1111,6 +1115,7 @@ async fn chain_address_pending_txs_handler(
         .unwrap_or("all")
         .trim()
         .to_ascii_lowercase();
+    let offset = query.offset.unwrap_or(0);
     if direction != "all" && direction != "in" && direction != "out" {
         return (
             StatusCode::BAD_REQUEST,
@@ -1156,11 +1161,11 @@ async fn chain_address_pending_txs_handler(
             }
         }
         let total = records.len();
-        let returned = if records.len() > limit {
-            records.into_iter().take(limit).collect::<Vec<_>>()
-        } else {
-            records
-        };
+        let returned = records
+            .into_iter()
+            .skip(offset)
+            .take(limit)
+            .collect::<Vec<_>>();
         Ok((total, returned))
     }) {
         Ok((total, transactions)) => (
@@ -1169,6 +1174,7 @@ async fn chain_address_pending_txs_handler(
                 "ok": true,
                 "address": address,
                 "direction": direction,
+                "offset": offset,
                 "total_count": total,
                 "returned_count": transactions.len(),
                 "transactions": transactions
@@ -3190,6 +3196,86 @@ mod tests {
         );
     }
 
+    /// 验证地址已确认交易查询支持 offset 分页。
+    #[tokio::test]
+    async fn chain_address_txs_should_support_offset_pagination() {
+        let app = build_test_app();
+        let (alice_wallet, alice_key_pair) = create_wallet("alice-pass").expect("创建钱包应成功");
+        let (bob_wallet, _) = create_wallet("bob-pass").expect("创建钱包应成功");
+
+        let _ = send_json(
+            &app,
+            Method::POST,
+            "/chain/mine",
+            json!({ "miner_address": alice_wallet.address.clone() }),
+        )
+        .await;
+
+        let mut tx_old = Transaction::new(
+            alice_wallet.address.clone(),
+            bob_wallet.address.clone(),
+            5,
+            Some(b"address-txs-offset-old".to_vec()),
+        );
+        tx_old
+            .sign_with_private_key(&alice_key_pair.private_key, &alice_key_pair.public_key)
+            .expect("签名应成功");
+        let tx_old_id = tx_old.id.clone();
+        let _ = send_json(
+            &app,
+            Method::POST,
+            "/chain/tx",
+            json!({ "transaction": tx_old }),
+        )
+        .await;
+        let _ = send_json(
+            &app,
+            Method::POST,
+            "/chain/mine",
+            json!({ "miner_address": "offset-miner-a" }),
+        )
+        .await;
+
+        let mut tx_new = Transaction::new(
+            alice_wallet.address.clone(),
+            bob_wallet.address.clone(),
+            6,
+            Some(b"address-txs-offset-new".to_vec()),
+        );
+        tx_new
+            .sign_with_private_key(&alice_key_pair.private_key, &alice_key_pair.public_key)
+            .expect("签名应成功");
+        let _ = send_json(
+            &app,
+            Method::POST,
+            "/chain/tx",
+            json!({ "transaction": tx_new }),
+        )
+        .await;
+        let _ = send_json(
+            &app,
+            Method::POST,
+            "/chain/mine",
+            json!({ "miner_address": "offset-miner-b" }),
+        )
+        .await;
+
+        let path = format!(
+            "/chain/address/{}/txs?direction=in&limit=1&offset=1",
+            bob_wallet.address
+        );
+        let (status, body) = send_empty(&app, Method::GET, &path).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["ok"], json!(true));
+        assert_eq!(body["offset"], json!(1));
+        assert_eq!(body["total_count"], json!(2));
+        assert_eq!(body["returned_count"], json!(1));
+        assert_eq!(
+            body["transactions"][0]["transaction"]["id"],
+            json!(tx_old_id)
+        );
+    }
+
     /// 验证地址交易查询传入非法 direction 会被拒绝。
     #[tokio::test]
     async fn chain_address_txs_with_invalid_direction_should_fail() {
@@ -3246,6 +3332,72 @@ mod tests {
         assert_eq!(body["ok"], json!(true));
         assert_eq!(body["returned_count"], json!(1));
         assert_eq!(body["transactions"][0]["transaction"]["id"], json!(tx_id));
+    }
+
+    /// 验证地址待打包交易查询支持 offset 分页。
+    #[tokio::test]
+    async fn chain_address_pending_txs_should_support_offset_pagination() {
+        let app = build_test_app();
+        let (alice_wallet, alice_key_pair) = create_wallet("alice-pass").expect("创建钱包应成功");
+        let (bob_wallet, _) = create_wallet("bob-pass").expect("创建钱包应成功");
+
+        let _ = send_json(
+            &app,
+            Method::POST,
+            "/chain/mine",
+            json!({ "miner_address": alice_wallet.address.clone() }),
+        )
+        .await;
+
+        let mut tx_old = Transaction::new(
+            alice_wallet.address.clone(),
+            bob_wallet.address.clone(),
+            4,
+            Some(b"address-pending-txs-offset-old".to_vec()),
+        );
+        tx_old
+            .sign_with_private_key(&alice_key_pair.private_key, &alice_key_pair.public_key)
+            .expect("签名应成功");
+        let tx_old_id = tx_old.id.clone();
+        let _ = send_json(
+            &app,
+            Method::POST,
+            "/chain/tx",
+            json!({ "transaction": tx_old }),
+        )
+        .await;
+
+        let mut tx_new = Transaction::new(
+            alice_wallet.address.clone(),
+            bob_wallet.address.clone(),
+            3,
+            Some(b"address-pending-txs-offset-new".to_vec()),
+        );
+        tx_new
+            .sign_with_private_key(&alice_key_pair.private_key, &alice_key_pair.public_key)
+            .expect("签名应成功");
+        let _ = send_json(
+            &app,
+            Method::POST,
+            "/chain/tx",
+            json!({ "transaction": tx_new }),
+        )
+        .await;
+
+        let path = format!(
+            "/chain/address/{}/pending-txs?direction=in&limit=1&offset=1",
+            bob_wallet.address
+        );
+        let (status, body) = send_empty(&app, Method::GET, &path).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["ok"], json!(true));
+        assert_eq!(body["offset"], json!(1));
+        assert_eq!(body["total_count"], json!(2));
+        assert_eq!(body["returned_count"], json!(1));
+        assert_eq!(
+            body["transactions"][0]["transaction"]["id"],
+            json!(tx_old_id)
+        );
     }
 
     /// 验证待打包交易地址查询传入非法 direction 会被拒绝。
