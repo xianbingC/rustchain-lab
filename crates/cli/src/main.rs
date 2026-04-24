@@ -161,7 +161,7 @@ fn run_sign_demo(args: &[String]) -> AppResult<()> {
 fn handle_chain_command(config: &AppConfig, args: &[String]) -> AppResult<()> {
     if args.len() < 2 {
         return Err(AppError::Command(
-            "chain 命令缺少子命令，可用: info/validate/latest-block/head/blocks/block/address-txs/address-pending-txs/tx/pending-tx/mempool/balance/contract-state/contract-events/contract-field/mine/transfer/contract-call-file/history-block/history-tx"
+            "chain 命令缺少子命令，可用: info/validate/latest-block/head/blocks/block/address-summary/address-txs/address-pending-txs/tx/pending-tx/mempool/balance/contract-state/contract-events/contract-field/mine/transfer/contract-call-file/history-block/history-tx"
                 .to_string(),
         ));
     }
@@ -239,6 +239,12 @@ fn handle_chain_command(config: &AppConfig, args: &[String]) -> AppResult<()> {
             let path = format!("/chain/block/{height}");
             let response = call_api_json(config, Method::GET, &path, None)?;
             print_json("chain_block", response)
+        }
+        "address-summary" => {
+            let address = require_arg(args, 2, "address")?;
+            let path = format!("/chain/address/{address}/summary");
+            let response = call_api_json(config, Method::GET, &path, None)?;
+            print_json("chain_address_summary", response)
         }
         "address-txs" => {
             let address = require_arg(args, 2, "address")?;
@@ -1048,6 +1054,7 @@ fn print_help() {
     println!("  rustchain-cli chain head [count]");
     println!("  rustchain-cli chain blocks [from_height] [limit]");
     println!("  rustchain-cli chain block <height>");
+    println!("  rustchain-cli chain address-summary <address>");
     println!("  rustchain-cli chain address-txs <address> [limit] [direction]");
     println!("  rustchain-cli chain address-pending-txs <address> [limit] [direction]");
     println!("  rustchain-cli chain tx <tx_id>");

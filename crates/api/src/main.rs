@@ -376,6 +376,10 @@ fn build_app(shared_state: AppState) -> Router {
             get(chain_address_txs_handler),
         )
         .route(
+            "/chain/address/:address/summary",
+            get(chain_address_summary_handler),
+        )
+        .route(
             "/chain/address/:address/pending-txs",
             get(chain_address_pending_txs_handler),
         )
@@ -1168,6 +1172,74 @@ async fn chain_address_pending_txs_handler(
                 "total_count": total,
                 "returned_count": transactions.len(),
                 "transactions": transactions
+            })),
+        ),
+        Err((status, body)) => (status, Json(body)),
+    }
+}
+
+/// 地址汇总查询：返回余额与已确认/待打包收支统计。
+async fn chain_address_summary_handler(
+    State(state): State<AppState>,
+    Path(address): Path<String>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    if address.trim().is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "ok": false,
+                "error": "address 不能为空"
+            })),
+        );
+    }
+
+    let balance = match with_state_store(&state, |store| store.get_balance(&address)) {
+        Ok(balance) => balance.unwrap_or(0),
+        Err((status, body)) => return (status, Json(body)),
+    };
+
+    match with_chain(&state, |chain| {
+        let mut confirmed_in_count = 0usize;
+        let mut confirmed_out_count = 0usize;
+        for block in &chain.chain {
+            for tx in &block.transactions {
+                if tx.to == address {
+                    confirmed_in_count = confirmed_in_count.saturating_add(1);
+                }
+                if tx.from == address {
+                    confirmed_out_count = confirmed_out_count.saturating_add(1);
+                }
+            }
+        }
+
+        let mut pending_in_count = 0usize;
+        let mut pending_out_count = 0usize;
+        for tx in &chain.pending_transactions {
+            if tx.to == address {
+                pending_in_count = pending_in_count.saturating_add(1);
+            }
+            if tx.from == address {
+                pending_out_count = pending_out_count.saturating_add(1);
+            }
+        }
+
+        Ok((
+            confirmed_in_count,
+            confirmed_out_count,
+            pending_in_count,
+            pending_out_count,
+        ))
+    }) {
+        Ok((confirmed_in_count, confirmed_out_count, pending_in_count, pending_out_count)) => (
+            StatusCode::OK,
+            Json(json!({
+                "ok": true,
+                "address": address,
+                "balance": balance,
+                "confirmed_in_count": confirmed_in_count,
+                "confirmed_out_count": confirmed_out_count,
+                "pending_in_count": pending_in_count,
+                "pending_out_count": pending_out_count
             })),
         ),
         Err((status, body)) => (status, Json(body)),
@@ -3163,6 +3235,73 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert_eq!(body["ok"], json!(false));
+    }
+
+    /// 验证可查询地址汇总（余额 + 已确认/待打包收支统计）。
+    #[tokio::test]
+    async fn chain_address_summary_should_return_counts_and_balance() {
+        let app = build_test_app();
+        let (alice_wallet, alice_key_pair) = create_wallet("alice-pass").expect("创建钱包应成功");
+        let (bob_wallet, bob_key_pair) = create_wallet("bob-pass").expect("创建钱包应成功");
+
+        let _ = send_json(
+            &app,
+            Method::POST,
+            "/chain/mine",
+            json!({ "miner_address": alice_wallet.address.clone() }),
+        )
+        .await;
+
+        let mut tx_confirmed = Transaction::new(
+            alice_wallet.address.clone(),
+            bob_wallet.address.clone(),
+            7,
+            Some(b"address-summary-confirmed".to_vec()),
+        );
+        tx_confirmed
+            .sign_with_private_key(&alice_key_pair.private_key, &alice_key_pair.public_key)
+            .expect("签名应成功");
+        let _ = send_json(
+            &app,
+            Method::POST,
+            "/chain/tx",
+            json!({ "transaction": tx_confirmed }),
+        )
+        .await;
+        let _ = send_json(
+            &app,
+            Method::POST,
+            "/chain/mine",
+            json!({ "miner_address": "summary-miner" }),
+        )
+        .await;
+
+        let mut tx_pending = Transaction::new(
+            bob_wallet.address.clone(),
+            alice_wallet.address.clone(),
+            3,
+            Some(b"address-summary-pending".to_vec()),
+        );
+        tx_pending
+            .sign_with_private_key(&bob_key_pair.private_key, &bob_key_pair.public_key)
+            .expect("签名应成功");
+        let _ = send_json(
+            &app,
+            Method::POST,
+            "/chain/tx",
+            json!({ "transaction": tx_pending }),
+        )
+        .await;
+
+        let path = format!("/chain/address/{}/summary", bob_wallet.address);
+        let (status, body) = send_empty(&app, Method::GET, &path).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["ok"], json!(true));
+        assert_eq!(body["balance"], json!(7));
+        assert_eq!(body["confirmed_in_count"], json!(1));
+        assert_eq!(body["confirmed_out_count"], json!(0));
+        assert_eq!(body["pending_in_count"], json!(0));
+        assert_eq!(body["pending_out_count"], json!(1));
     }
 
     /// 验证可按高度查询区块详情。
