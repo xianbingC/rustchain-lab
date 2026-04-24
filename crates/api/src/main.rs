@@ -1201,36 +1201,57 @@ async fn chain_address_summary_handler(
     match with_chain(&state, |chain| {
         let mut confirmed_in_count = 0usize;
         let mut confirmed_out_count = 0usize;
+        let mut confirmed_in_amount = 0u64;
+        let mut confirmed_out_amount = 0u64;
         for block in &chain.chain {
             for tx in &block.transactions {
                 if tx.to == address {
                     confirmed_in_count = confirmed_in_count.saturating_add(1);
+                    confirmed_in_amount = confirmed_in_amount.saturating_add(tx.amount);
                 }
                 if tx.from == address {
                     confirmed_out_count = confirmed_out_count.saturating_add(1);
+                    confirmed_out_amount = confirmed_out_amount.saturating_add(tx.amount);
                 }
             }
         }
 
         let mut pending_in_count = 0usize;
         let mut pending_out_count = 0usize;
+        let mut pending_in_amount = 0u64;
+        let mut pending_out_amount = 0u64;
         for tx in &chain.pending_transactions {
             if tx.to == address {
                 pending_in_count = pending_in_count.saturating_add(1);
+                pending_in_amount = pending_in_amount.saturating_add(tx.amount);
             }
             if tx.from == address {
                 pending_out_count = pending_out_count.saturating_add(1);
+                pending_out_amount = pending_out_amount.saturating_add(tx.amount);
             }
         }
 
         Ok((
             confirmed_in_count,
             confirmed_out_count,
+            confirmed_in_amount,
+            confirmed_out_amount,
             pending_in_count,
             pending_out_count,
+            pending_in_amount,
+            pending_out_amount,
         ))
     }) {
-        Ok((confirmed_in_count, confirmed_out_count, pending_in_count, pending_out_count)) => (
+        Ok((
+            confirmed_in_count,
+            confirmed_out_count,
+            confirmed_in_amount,
+            confirmed_out_amount,
+            pending_in_count,
+            pending_out_count,
+            pending_in_amount,
+            pending_out_amount,
+        )) => (
             StatusCode::OK,
             Json(json!({
                 "ok": true,
@@ -1238,8 +1259,12 @@ async fn chain_address_summary_handler(
                 "balance": balance,
                 "confirmed_in_count": confirmed_in_count,
                 "confirmed_out_count": confirmed_out_count,
+                "confirmed_in_amount": confirmed_in_amount,
+                "confirmed_out_amount": confirmed_out_amount,
                 "pending_in_count": pending_in_count,
-                "pending_out_count": pending_out_count
+                "pending_out_count": pending_out_count,
+                "pending_in_amount": pending_in_amount,
+                "pending_out_amount": pending_out_amount
             })),
         ),
         Err((status, body)) => (status, Json(body)),
@@ -3300,8 +3325,12 @@ mod tests {
         assert_eq!(body["balance"], json!(7));
         assert_eq!(body["confirmed_in_count"], json!(1));
         assert_eq!(body["confirmed_out_count"], json!(0));
+        assert_eq!(body["confirmed_in_amount"], json!(7));
+        assert_eq!(body["confirmed_out_amount"], json!(0));
         assert_eq!(body["pending_in_count"], json!(0));
         assert_eq!(body["pending_out_count"], json!(1));
+        assert_eq!(body["pending_in_amount"], json!(0));
+        assert_eq!(body["pending_out_amount"], json!(3));
     }
 
     /// 验证可按高度查询区块详情。
