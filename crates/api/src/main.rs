@@ -185,6 +185,8 @@ struct ChainBlocksQuery {
 struct ChainAddressTxsQuery {
     /// 可选返回条数上限（1~200），默认 20。
     limit: Option<usize>,
+    /// 方向过滤：all/in/out，默认 all。
+    direction: Option<String>,
 }
 
 /// 地址交易查询项。
@@ -194,6 +196,8 @@ struct ChainAddressTxRecord {
     block_index: u64,
     /// 所在区块哈希。
     block_hash: String,
+    /// 相对查询地址的方向（in/out/self）。
+    direction: String,
     /// 交易详情。
     transaction: Transaction,
 }
@@ -974,15 +978,62 @@ async fn chain_address_txs_handler(
             })),
         );
     }
+    let direction = query
+        .direction
+        .as_deref()
+        .unwrap_or("all")
+        .trim()
+        .to_ascii_lowercase();
+    if direction != "all" && direction != "in" && direction != "out" {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "ok": false,
+                "error": "direction 必须是 all/in/out"
+            })),
+        );
+    }
 
     match with_chain(&state, |chain| {
         let mut records = Vec::new();
         for block in chain.chain.iter().rev() {
             for tx in &block.transactions {
-                if tx.from == address || tx.to == address {
+                let is_out = tx.from == address;
+                let is_in = tx.to == address;
+                if !is_out && !is_in {
+                    continue;
+                }
+
+                if direction == "in" && !is_in {
+                    continue;
+                }
+                if direction == "out" && !is_out {
+                    continue;
+                }
+
+                let tx_direction = if is_in && is_out {
+                    "self".to_string()
+                } else if is_out {
+                    "out".to_string()
+                } else {
+                    "in".to_string()
+                };
+                if direction == "in" && tx_direction == "self" {
+                    // self 方向同时属于 in/out，避免 in/out 过滤时遗漏。
+                    // 此处保持记录方向为 self，便于调用方识别。
+                }
+                if direction == "out" && tx_direction == "self" {
+                    // 同上，self 在 out 过滤下也保留。
+                }
+
+                if direction == "all"
+                    || direction == tx_direction
+                    || (tx_direction == "self" && (direction == "in" || direction == "out"))
+                {
                     records.push(ChainAddressTxRecord {
                         block_index: block.index,
                         block_hash: block.hash.clone(),
+                        direction: tx_direction,
                         transaction: tx.clone(),
                     });
                 }
@@ -1001,6 +1052,7 @@ async fn chain_address_txs_handler(
             Json(json!({
                 "ok": true,
                 "address": address,
+                "direction": direction,
                 "total_count": total,
                 "returned_count": transactions.len(),
                 "transactions": transactions
@@ -2838,6 +2890,107 @@ mod tests {
         let app = build_test_app();
         let (status, body) =
             send_empty(&app, Method::GET, "/chain/address/alice/txs?limit=0").await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["ok"], json!(false));
+    }
+
+    /// 验证地址交易查询支持方向过滤（in/out）。
+    #[tokio::test]
+    async fn chain_address_txs_should_support_direction_filter() {
+        let app = build_test_app();
+        let (alice_wallet, alice_key_pair) = create_wallet("alice-pass").expect("创建钱包应成功");
+        let (bob_wallet, bob_key_pair) = create_wallet("bob-pass").expect("创建钱包应成功");
+        let (carol_wallet, _) = create_wallet("carol-pass").expect("创建钱包应成功");
+
+        let _ = send_json(
+            &app,
+            Method::POST,
+            "/chain/mine",
+            json!({ "miner_address": alice_wallet.address.clone() }),
+        )
+        .await;
+
+        let mut tx_in = Transaction::new(
+            alice_wallet.address.clone(),
+            bob_wallet.address.clone(),
+            15,
+            Some(b"address-txs-direction-in".to_vec()),
+        );
+        tx_in
+            .sign_with_private_key(&alice_key_pair.private_key, &alice_key_pair.public_key)
+            .expect("签名应成功");
+        let tx_in_id = tx_in.id.clone();
+
+        let _ = send_json(
+            &app,
+            Method::POST,
+            "/chain/tx",
+            json!({ "transaction": tx_in }),
+        )
+        .await;
+        let _ = send_json(
+            &app,
+            Method::POST,
+            "/chain/mine",
+            json!({ "miner_address": "direction-miner-a" }),
+        )
+        .await;
+
+        let mut tx_out = Transaction::new(
+            bob_wallet.address.clone(),
+            carol_wallet.address.clone(),
+            6,
+            Some(b"address-txs-direction-out".to_vec()),
+        );
+        tx_out
+            .sign_with_private_key(&bob_key_pair.private_key, &bob_key_pair.public_key)
+            .expect("签名应成功");
+        let tx_out_id = tx_out.id.clone();
+
+        let _ = send_json(
+            &app,
+            Method::POST,
+            "/chain/tx",
+            json!({ "transaction": tx_out }),
+        )
+        .await;
+        let _ = send_json(
+            &app,
+            Method::POST,
+            "/chain/mine",
+            json!({ "miner_address": "direction-miner-b" }),
+        )
+        .await;
+
+        let path_in = format!("/chain/address/{}/txs?direction=in", bob_wallet.address);
+        let (status, body) = send_empty(&app, Method::GET, &path_in).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["returned_count"], json!(1));
+        assert_eq!(
+            body["transactions"][0]["transaction"]["id"],
+            json!(tx_in_id)
+        );
+
+        let path_out = format!("/chain/address/{}/txs?direction=out", bob_wallet.address);
+        let (status, body) = send_empty(&app, Method::GET, &path_out).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["returned_count"], json!(1));
+        assert_eq!(
+            body["transactions"][0]["transaction"]["id"],
+            json!(tx_out_id)
+        );
+    }
+
+    /// 验证地址交易查询传入非法 direction 会被拒绝。
+    #[tokio::test]
+    async fn chain_address_txs_with_invalid_direction_should_fail() {
+        let app = build_test_app();
+        let (status, body) = send_empty(
+            &app,
+            Method::GET,
+            "/chain/address/alice/txs?direction=sideways",
+        )
+        .await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert_eq!(body["ok"], json!(false));
     }

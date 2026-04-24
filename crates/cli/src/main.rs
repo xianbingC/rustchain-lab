@@ -242,21 +242,18 @@ fn handle_chain_command(config: &AppConfig, args: &[String]) -> AppResult<()> {
         }
         "address-txs" => {
             let address = require_arg(args, 2, "address")?;
-            let limit = args
-                .get(3)
-                .map(|raw| {
-                    raw.parse::<usize>()
-                        .map_err(|error| AppError::Command(format!("limit 参数解析失败: {error}")))
-                })
-                .transpose()?;
+            let (limit, direction) = parse_address_txs_args(args)?;
+            let mut query_pairs = Vec::new();
             if let Some(limit) = limit {
-                if limit == 0 || limit > 200 {
-                    return Err(AppError::Command("limit 必须在 1~200 之间".to_string()));
-                }
+                query_pairs.push(format!("limit={limit}"));
             }
-            let path = match limit {
-                Some(limit) => format!("/chain/address/{address}/txs?limit={limit}"),
-                None => format!("/chain/address/{address}/txs"),
+            if let Some(direction) = direction {
+                query_pairs.push(format!("direction={direction}"));
+            }
+            let path = if query_pairs.is_empty() {
+                format!("/chain/address/{address}/txs")
+            } else {
+                format!("/chain/address/{address}/txs?{}", query_pairs.join("&"))
             };
             let response = call_api_json(config, Method::GET, &path, None)?;
             print_json("chain_address_txs", response)
@@ -899,6 +896,50 @@ fn parse_mempool_args(args: &[String]) -> AppResult<(Option<usize>, Option<Strin
     Ok((None, Some(raw1.to_string())))
 }
 
+/// 解析地址交易查询参数，支持 [limit]、[direction]、[limit] [direction]。
+fn parse_address_txs_args(args: &[String]) -> AppResult<(Option<usize>, Option<String>)> {
+    let raw1 = args.get(3).map(|value| value.trim()).unwrap_or_default();
+    let raw2 = args.get(4).map(|value| value.trim()).unwrap_or_default();
+
+    if raw1.is_empty() && raw2.is_empty() {
+        return Ok((None, None));
+    }
+    if raw1.is_empty() && !raw2.is_empty() {
+        return Err(AppError::Command(
+            "address-txs 参数错误：direction 需要放在 limit 之后或单独作为第一个参数".to_string(),
+        ));
+    }
+
+    let parse_direction = |value: &str| -> AppResult<String> {
+        let normalized = value.to_ascii_lowercase();
+        if normalized == "all" || normalized == "in" || normalized == "out" {
+            Ok(normalized)
+        } else {
+            Err(AppError::Command("direction 必须是 all/in/out".to_string()))
+        }
+    };
+
+    if let Ok(limit) = raw1.parse::<usize>() {
+        if limit == 0 || limit > 200 {
+            return Err(AppError::Command("limit 必须在 1~200 之间".to_string()));
+        }
+        let direction = if raw2.is_empty() {
+            None
+        } else {
+            Some(parse_direction(raw2)?)
+        };
+        return Ok((Some(limit), direction));
+    }
+
+    if !raw2.is_empty() {
+        return Err(AppError::Command(
+            "address-txs 参数错误：当提供两个参数时，第一个必须是 limit".to_string(),
+        ));
+    }
+
+    Ok((None, Some(parse_direction(raw1)?)))
+}
+
 /// 从链信息响应中提取最新高度。
 fn parse_chain_height(chain_info: &Value) -> AppResult<u64> {
     chain_info["chain"]["height"]
@@ -986,7 +1027,7 @@ fn print_help() {
     println!("  rustchain-cli chain head [count]");
     println!("  rustchain-cli chain blocks [from_height] [limit]");
     println!("  rustchain-cli chain block <height>");
-    println!("  rustchain-cli chain address-txs <address> [limit]");
+    println!("  rustchain-cli chain address-txs <address> [limit] [direction]");
     println!("  rustchain-cli chain tx <tx_id>");
     println!("  rustchain-cli chain pending-tx <tx_id>");
     println!("  rustchain-cli chain mempool [limit] [address]");
@@ -1037,8 +1078,8 @@ fn print_help() {
 mod tests {
     use super::{
         api_base_url, build_signed_contract_call_tx, build_signed_transfer_tx,
-        compute_head_from_height, parse_chain_height, parse_mempool_args, read_contract_source,
-        require_arg,
+        compute_head_from_height, parse_address_txs_args, parse_chain_height, parse_mempool_args,
+        read_contract_source, require_arg,
     };
     use rustchain_common::AppConfig;
     use rustchain_crypto::wallet::create_wallet;
@@ -1201,6 +1242,35 @@ mod tests {
         let (limit, address) = parse_mempool_args(&args).expect("参数解析应成功");
         assert_eq!(limit, None);
         assert_eq!(address.as_deref(), Some("addr-demo"));
+    }
+
+    /// 验证地址交易参数解析支持 limit + direction。
+    #[test]
+    fn parse_address_txs_args_should_support_limit_and_direction() {
+        let args = vec![
+            "chain".to_string(),
+            "address-txs".to_string(),
+            "addr-demo".to_string(),
+            "5".to_string(),
+            "out".to_string(),
+        ];
+        let (limit, direction) = parse_address_txs_args(&args).expect("参数解析应成功");
+        assert_eq!(limit, Some(5));
+        assert_eq!(direction.as_deref(), Some("out"));
+    }
+
+    /// 验证地址交易参数解析支持单独 direction。
+    #[test]
+    fn parse_address_txs_args_should_support_only_direction() {
+        let args = vec![
+            "chain".to_string(),
+            "address-txs".to_string(),
+            "addr-demo".to_string(),
+            "in".to_string(),
+        ];
+        let (limit, direction) = parse_address_txs_args(&args).expect("参数解析应成功");
+        assert_eq!(limit, None);
+        assert_eq!(direction.as_deref(), Some("in"));
     }
 
     /// 生成测试临时文件路径。
