@@ -161,7 +161,7 @@ fn run_sign_demo(args: &[String]) -> AppResult<()> {
 fn handle_chain_command(config: &AppConfig, args: &[String]) -> AppResult<()> {
     if args.len() < 2 {
         return Err(AppError::Command(
-            "chain 命令缺少子命令，可用: info/validate/latest-block/head/blocks/block/address-txs/tx/pending-tx/mempool/balance/contract-state/contract-events/contract-field/mine/transfer/contract-call-file/history-block/history-tx"
+            "chain 命令缺少子命令，可用: info/validate/latest-block/head/blocks/block/address-txs/address-pending-txs/tx/pending-tx/mempool/balance/contract-state/contract-events/contract-field/mine/transfer/contract-call-file/history-block/history-tx"
                 .to_string(),
         ));
     }
@@ -257,6 +257,27 @@ fn handle_chain_command(config: &AppConfig, args: &[String]) -> AppResult<()> {
             };
             let response = call_api_json(config, Method::GET, &path, None)?;
             print_json("chain_address_txs", response)
+        }
+        "address-pending-txs" => {
+            let address = require_arg(args, 2, "address")?;
+            let (limit, direction) = parse_address_txs_args(args)?;
+            let mut query_pairs = Vec::new();
+            if let Some(limit) = limit {
+                query_pairs.push(format!("limit={limit}"));
+            }
+            if let Some(direction) = direction {
+                query_pairs.push(format!("direction={direction}"));
+            }
+            let path = if query_pairs.is_empty() {
+                format!("/chain/address/{address}/pending-txs")
+            } else {
+                format!(
+                    "/chain/address/{address}/pending-txs?{}",
+                    query_pairs.join("&")
+                )
+            };
+            let response = call_api_json(config, Method::GET, &path, None)?;
+            print_json("chain_address_pending_txs", response)
         }
         "tx" => {
             let tx_id = require_arg(args, 2, "tx_id")?;
@@ -1028,6 +1049,7 @@ fn print_help() {
     println!("  rustchain-cli chain blocks [from_height] [limit]");
     println!("  rustchain-cli chain block <height>");
     println!("  rustchain-cli chain address-txs <address> [limit] [direction]");
+    println!("  rustchain-cli chain address-pending-txs <address> [limit] [direction]");
     println!("  rustchain-cli chain tx <tx_id>");
     println!("  rustchain-cli chain pending-tx <tx_id>");
     println!("  rustchain-cli chain mempool [limit] [address]");

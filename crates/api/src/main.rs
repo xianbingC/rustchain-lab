@@ -202,6 +202,15 @@ struct ChainAddressTxRecord {
     transaction: Transaction,
 }
 
+/// 地址待打包交易查询项。
+#[derive(Debug, Clone, Serialize)]
+struct ChainAddressPendingTxRecord {
+    /// 相对查询地址的方向（in/out/self）。
+    direction: String,
+    /// 交易详情。
+    transaction: Transaction,
+}
+
 /// 创建钱包接口（原型阶段同时返回密钥对用于学习调试）。
 async fn wallet_create_handler(
     Json(payload): Json<CreateWalletRequest>,
@@ -365,6 +374,10 @@ fn build_app(shared_state: AppState) -> Router {
         .route(
             "/chain/address/:address/txs",
             get(chain_address_txs_handler),
+        )
+        .route(
+            "/chain/address/:address/pending-txs",
+            get(chain_address_pending_txs_handler),
         )
         .route("/chain/pending-tx/:tx_id", get(chain_pending_tx_handler))
         .route("/chain/tx/:tx_id", get(chain_tx_query_handler))
@@ -1037,6 +1050,105 @@ async fn chain_address_txs_handler(
                         transaction: tx.clone(),
                     });
                 }
+            }
+        }
+        let total = records.len();
+        let returned = if records.len() > limit {
+            records.into_iter().take(limit).collect::<Vec<_>>()
+        } else {
+            records
+        };
+        Ok((total, returned))
+    }) {
+        Ok((total, transactions)) => (
+            StatusCode::OK,
+            Json(json!({
+                "ok": true,
+                "address": address,
+                "direction": direction,
+                "total_count": total,
+                "returned_count": transactions.len(),
+                "transactions": transactions
+            })),
+        ),
+        Err((status, body)) => (status, Json(body)),
+    }
+}
+
+/// 按地址查询待打包交易列表（from/to 任一匹配）。
+async fn chain_address_pending_txs_handler(
+    State(state): State<AppState>,
+    Path(address): Path<String>,
+    Query(query): Query<ChainAddressTxsQuery>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    if address.trim().is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "ok": false,
+                "error": "address 不能为空"
+            })),
+        );
+    }
+
+    let limit = query.limit.unwrap_or(20);
+    if limit == 0 || limit > 200 {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "ok": false,
+                "error": "limit 必须在 1~200 之间"
+            })),
+        );
+    }
+    let direction = query
+        .direction
+        .as_deref()
+        .unwrap_or("all")
+        .trim()
+        .to_ascii_lowercase();
+    if direction != "all" && direction != "in" && direction != "out" {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "ok": false,
+                "error": "direction 必须是 all/in/out"
+            })),
+        );
+    }
+
+    match with_chain(&state, |chain| {
+        let mut records = Vec::new();
+        for tx in chain.pending_transactions.iter().rev() {
+            let is_out = tx.from == address;
+            let is_in = tx.to == address;
+            if !is_out && !is_in {
+                continue;
+            }
+
+            if direction == "in" && !is_in {
+                continue;
+            }
+            if direction == "out" && !is_out {
+                continue;
+            }
+
+            let tx_direction = if is_in && is_out {
+                "self".to_string()
+            } else if is_out {
+                "out".to_string()
+            } else {
+                "in".to_string()
+            };
+
+            if direction == "all"
+                || direction == tx_direction
+                || (tx_direction == "self" && (direction == "in" || direction == "out"))
+            {
+                records.push(ChainAddressPendingTxRecord {
+                    direction: tx_direction,
+                    transaction: tx.clone(),
+                });
             }
         }
         let total = records.len();
@@ -2989,6 +3101,64 @@ mod tests {
             &app,
             Method::GET,
             "/chain/address/alice/txs?direction=sideways",
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["ok"], json!(false));
+    }
+
+    /// 验证可按地址查询待打包交易列表。
+    #[tokio::test]
+    async fn chain_address_pending_txs_should_return_transactions() {
+        let app = build_test_app();
+        let (alice_wallet, alice_key_pair) = create_wallet("alice-pass").expect("创建钱包应成功");
+        let (bob_wallet, _) = create_wallet("bob-pass").expect("创建钱包应成功");
+
+        let _ = send_json(
+            &app,
+            Method::POST,
+            "/chain/mine",
+            json!({ "miner_address": alice_wallet.address.clone() }),
+        )
+        .await;
+
+        let mut tx = Transaction::new(
+            alice_wallet.address.clone(),
+            bob_wallet.address.clone(),
+            9,
+            Some(b"address-pending-txs-query".to_vec()),
+        );
+        tx.sign_with_private_key(&alice_key_pair.private_key, &alice_key_pair.public_key)
+            .expect("签名应成功");
+        let tx_id = tx.id.clone();
+
+        let _ = send_json(
+            &app,
+            Method::POST,
+            "/chain/tx",
+            json!({ "transaction": tx }),
+        )
+        .await;
+
+        let path = format!(
+            "/chain/address/{}/pending-txs?direction=in",
+            bob_wallet.address
+        );
+        let (status, body) = send_empty(&app, Method::GET, &path).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["ok"], json!(true));
+        assert_eq!(body["returned_count"], json!(1));
+        assert_eq!(body["transactions"][0]["transaction"]["id"], json!(tx_id));
+    }
+
+    /// 验证待打包交易地址查询传入非法 direction 会被拒绝。
+    #[tokio::test]
+    async fn chain_address_pending_txs_with_invalid_direction_should_fail() {
+        let app = build_test_app();
+        let (status, body) = send_empty(
+            &app,
+            Method::GET,
+            "/chain/address/alice/pending-txs?direction=sideways",
         )
         .await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
