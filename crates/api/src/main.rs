@@ -169,6 +169,8 @@ struct ChainMempoolQuery {
     limit: Option<usize>,
     /// 可选地址过滤（匹配 from 或 to）。
     address: Option<String>,
+    /// 偏移量（>=0），默认 0。
+    offset: Option<usize>,
 }
 
 /// 区块列表查询参数。
@@ -896,23 +898,32 @@ async fn chain_mempool_handler(
             })),
         );
     }
+    let limit = query.limit;
+    let offset = query.offset.unwrap_or(0);
+    let filter_address = query.address.clone();
+    let normalized_filter_address = filter_address
+        .as_ref()
+        .map(|address| address.trim().to_string());
 
     match with_chain(&state, |chain| {
         let total = chain.pending_transactions.len();
-        let filter_address = query.address.as_ref().map(|address| address.trim());
         let filtered = chain
             .pending_transactions
             .iter()
-            .filter(|tx| match filter_address {
+            .filter(|tx| match normalized_filter_address.as_deref() {
                 Some(address) => tx.from == address || tx.to == address,
                 None => true,
             })
             .cloned()
             .collect::<Vec<_>>();
         let matched_count = filtered.len();
-        let transactions = match query.limit {
-            Some(limit) => filtered.into_iter().take(limit).collect(),
-            None => filtered,
+        let transactions: Vec<Transaction> = match limit {
+            Some(limit) => filtered
+                .into_iter()
+                .skip(offset)
+                .take(limit)
+                .collect::<Vec<_>>(),
+            None => filtered.into_iter().skip(offset).collect::<Vec<_>>(),
         };
         Ok((total, matched_count, transactions))
     }) {
@@ -922,7 +933,8 @@ async fn chain_mempool_handler(
                 "ok": true,
                 "total_pending_tx_count": total,
                 "matched_count": matched_count,
-                "filter_address": query.address,
+                "filter_address": filter_address,
+                "offset": offset,
                 "returned_count": transactions.len(),
                 "transactions": transactions
             })),
@@ -2916,6 +2928,67 @@ mod tests {
                 .len(),
             1
         );
+    }
+
+    /// 验证交易池查询支持 offset 分页。
+    #[tokio::test]
+    async fn chain_mempool_should_support_offset_query() {
+        let app = build_test_app();
+        let (alice_wallet, alice_key_pair) = create_wallet("alice-pass").expect("创建钱包应成功");
+        let (bob_wallet, _) = create_wallet("bob-pass").expect("创建钱包应成功");
+
+        let _ = send_json(
+            &app,
+            Method::POST,
+            "/chain/mine",
+            json!({ "miner_address": alice_wallet.address.clone() }),
+        )
+        .await;
+
+        let mut tx1 = Transaction::new(
+            alice_wallet.address.clone(),
+            bob_wallet.address.clone(),
+            10,
+            Some(b"mempool-offset-1".to_vec()),
+        );
+        tx1.sign_with_private_key(&alice_key_pair.private_key, &alice_key_pair.public_key)
+            .expect("签名应成功");
+        let tx1_id = tx1.id.clone();
+
+        let mut tx2 = Transaction::new(
+            alice_wallet.address.clone(),
+            bob_wallet.address.clone(),
+            6,
+            Some(b"mempool-offset-2".to_vec()),
+        );
+        tx2.sign_with_private_key(&alice_key_pair.private_key, &alice_key_pair.public_key)
+            .expect("签名应成功");
+        let tx2_id = tx2.id.clone();
+
+        let _ = send_json(
+            &app,
+            Method::POST,
+            "/chain/tx",
+            json!({ "transaction": tx1 }),
+        )
+        .await;
+        let _ = send_json(
+            &app,
+            Method::POST,
+            "/chain/tx",
+            json!({ "transaction": tx2 }),
+        )
+        .await;
+
+        let (status, body) = send_empty(&app, Method::GET, "/chain/mempool?offset=1&limit=1").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["ok"], json!(true));
+        assert_eq!(body["offset"], json!(1));
+        assert_eq!(body["total_pending_tx_count"], json!(2));
+        assert_eq!(body["matched_count"], json!(2));
+        assert_eq!(body["returned_count"], json!(1));
+        assert_eq!(body["transactions"][0]["id"], json!(tx2_id));
+        assert_ne!(body["transactions"][0]["id"], json!(tx1_id));
     }
 
     /// 验证交易池查询 limit=0 会被拒绝。

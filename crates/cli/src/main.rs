@@ -304,13 +304,16 @@ fn handle_chain_command(config: &AppConfig, args: &[String]) -> AppResult<()> {
             print_json("chain_pending_tx", response)
         }
         "mempool" => {
-            let (limit, address) = parse_mempool_args(args)?;
+            let (limit, address, offset) = parse_mempool_args(args)?;
             let mut query_pairs = Vec::new();
             if let Some(limit) = limit {
                 query_pairs.push(format!("limit={limit}"));
             }
             if let Some(address) = address {
                 query_pairs.push(format!("address={address}"));
+            }
+            if let Some(offset) = offset {
+                query_pairs.push(format!("offset={offset}"));
             }
             let path = if query_pairs.is_empty() {
                 "/chain/mempool".to_string()
@@ -893,15 +896,18 @@ fn parse_u64_arg(args: &[String], index: usize, name: &str) -> AppResult<u64> {
         .map_err(|error| AppError::Command(format!("{name} 参数解析失败: {error}")))
 }
 
-/// 解析交易池查询参数，支持 [limit]、[address]、[limit] [address] 三种形态。
-fn parse_mempool_args(args: &[String]) -> AppResult<(Option<usize>, Option<String>)> {
+/// 解析交易池查询参数，支持 [limit]、[address]、[limit] [address]、[limit] [offset]、[address] [offset]、[limit] [address] [offset]。
+fn parse_mempool_args(
+    args: &[String],
+) -> AppResult<(Option<usize>, Option<String>, Option<usize>)> {
     let raw1 = args.get(2).map(|value| value.trim()).unwrap_or_default();
     let raw2 = args.get(3).map(|value| value.trim()).unwrap_or_default();
+    let raw3 = args.get(4).map(|value| value.trim()).unwrap_or_default();
 
-    if raw1.is_empty() && raw2.is_empty() {
-        return Ok((None, None));
+    if raw1.is_empty() && raw2.is_empty() && raw3.is_empty() {
+        return Ok((None, None, None));
     }
-    if raw1.is_empty() && !raw2.is_empty() {
+    if raw1.is_empty() && (!raw2.is_empty() || !raw3.is_empty()) {
         return Err(AppError::Command(
             "mempool 参数错误：address 需要放在 limit 之后或单独作为第一个参数".to_string(),
         ));
@@ -912,21 +918,52 @@ fn parse_mempool_args(args: &[String]) -> AppResult<(Option<usize>, Option<Strin
         if limit == 0 {
             return Err(AppError::Command("limit 必须大于 0".to_string()));
         }
-        let address = if raw2.is_empty() {
+        if raw2.is_empty() {
+            if raw3.is_empty() {
+                return Ok((Some(limit), None, None));
+            }
+            return Err(AppError::Command(
+                "mempool 参数错误：offset 需要放在 address 之后或作为第二个参数".to_string(),
+            ));
+        }
+
+        if let Ok(offset_only) = raw2.parse::<usize>() {
+            if !raw3.is_empty() {
+                return Err(AppError::Command(
+                    "mempool 参数错误：当第二个参数为 offset 时，不能再提供第三个参数".to_string(),
+                ));
+            }
+            return Ok((Some(limit), None, Some(offset_only)));
+        }
+
+        let address = Some(raw2.to_string());
+        let offset = if raw3.is_empty() {
             None
         } else {
-            Some(raw2.to_string())
+            Some(
+                raw3.parse::<usize>()
+                    .map_err(|error| AppError::Command(format!("offset 参数解析失败: {error}")))?,
+            )
         };
-        return Ok((Some(limit), address));
+        return Ok((Some(limit), address, offset));
     }
 
-    if !raw2.is_empty() {
+    if !raw3.is_empty() {
         return Err(AppError::Command(
-            "mempool 参数错误：当提供两个参数时，第一个必须是 limit".to_string(),
+            "mempool 参数错误：最多支持两个非 limit 参数（address、offset）".to_string(),
         ));
     }
 
-    Ok((None, Some(raw1.to_string())))
+    let offset = if raw2.is_empty() {
+        None
+    } else {
+        Some(
+            raw2.parse::<usize>()
+                .map_err(|error| AppError::Command(format!("offset 参数解析失败: {error}")))?,
+        )
+    };
+
+    Ok((None, Some(raw1.to_string()), offset))
 }
 
 /// 解析地址交易查询参数，支持 [limit]、[direction]、[limit] [offset]、[direction] [offset]、[limit] [direction] [offset]。
@@ -1103,7 +1140,7 @@ fn print_help() {
     println!("  rustchain-cli chain address-pending-txs <address> [limit] [direction] [offset]");
     println!("  rustchain-cli chain tx <tx_id>");
     println!("  rustchain-cli chain pending-tx <tx_id>");
-    println!("  rustchain-cli chain mempool [limit] [address]");
+    println!("  rustchain-cli chain mempool [limit] [address] [offset]");
     println!("  rustchain-cli chain balance <address>");
     println!("  rustchain-cli chain contract-state <address>");
     println!("  rustchain-cli chain contract-events <address>");
@@ -1299,9 +1336,10 @@ mod tests {
             "5".to_string(),
             "addr-demo".to_string(),
         ];
-        let (limit, address) = parse_mempool_args(&args).expect("参数解析应成功");
+        let (limit, address, offset) = parse_mempool_args(&args).expect("参数解析应成功");
         assert_eq!(limit, Some(5));
         assert_eq!(address.as_deref(), Some("addr-demo"));
+        assert_eq!(offset, None);
     }
 
     /// 验证交易池命令参数解析支持单独 address。
@@ -1312,9 +1350,40 @@ mod tests {
             "mempool".to_string(),
             "addr-demo".to_string(),
         ];
-        let (limit, address) = parse_mempool_args(&args).expect("参数解析应成功");
+        let (limit, address, offset) = parse_mempool_args(&args).expect("参数解析应成功");
         assert_eq!(limit, None);
         assert_eq!(address.as_deref(), Some("addr-demo"));
+        assert_eq!(offset, None);
+    }
+
+    /// 验证交易池命令参数解析支持 limit + offset。
+    #[test]
+    fn parse_mempool_args_should_support_limit_and_offset() {
+        let args = vec![
+            "chain".to_string(),
+            "mempool".to_string(),
+            "5".to_string(),
+            "2".to_string(),
+        ];
+        let (limit, address, offset) = parse_mempool_args(&args).expect("参数解析应成功");
+        assert_eq!(limit, Some(5));
+        assert_eq!(address, None);
+        assert_eq!(offset, Some(2));
+    }
+
+    /// 验证交易池命令参数解析支持 address + offset。
+    #[test]
+    fn parse_mempool_args_should_support_address_and_offset() {
+        let args = vec![
+            "chain".to_string(),
+            "mempool".to_string(),
+            "addr-demo".to_string(),
+            "3".to_string(),
+        ];
+        let (limit, address, offset) = parse_mempool_args(&args).expect("参数解析应成功");
+        assert_eq!(limit, None);
+        assert_eq!(address.as_deref(), Some("addr-demo"));
+        assert_eq!(offset, Some(3));
     }
 
     /// 验证地址交易参数解析支持 limit + direction。
