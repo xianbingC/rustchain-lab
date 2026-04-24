@@ -341,6 +341,7 @@ fn build_app(shared_state: AppState) -> Router {
         .route("/chain/blocks", get(chain_blocks_handler))
         .route("/chain/block/:height", get(chain_block_by_height_handler))
         .route("/chain/pending-tx/:tx_id", get(chain_pending_tx_handler))
+        .route("/chain/tx/:tx_id", get(chain_tx_query_handler))
         .route("/chain/mempool", get(chain_mempool_handler))
         .route("/chain/balance/:address", get(chain_balance_handler))
         .route(
@@ -919,6 +920,71 @@ async fn chain_pending_tx_handler(
             Json(json!({
                 "ok": false,
                 "error": format!("待打包交易不存在: {tx_id}")
+            })),
+        ),
+        Err((status, body)) => (status, Json(body)),
+    }
+}
+
+/// 统一交易查询接口：优先查询待打包交易，其次查询历史交易。
+async fn chain_tx_query_handler(
+    State(state): State<AppState>,
+    Path(tx_id): Path<String>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    if tx_id.trim().is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "ok": false,
+                "error": "tx_id 不能为空"
+            })),
+        );
+    }
+
+    match with_chain(&state, |chain| {
+        Ok(chain
+            .pending_transactions
+            .iter()
+            .find(|tx| tx.id == tx_id)
+            .cloned())
+    }) {
+        Ok(Some(transaction)) => {
+            return (
+                StatusCode::OK,
+                Json(json!({
+                    "ok": true,
+                    "source": "pending",
+                    "transaction": transaction
+                })),
+            );
+        }
+        Ok(None) => {}
+        Err((status, body)) => return (status, Json(body)),
+    }
+
+    match with_history(&state, |history| history.get_transaction(&tx_id)) {
+        Ok(Some(raw)) => match bincode::deserialize::<Transaction>(&raw) {
+            Ok(transaction) => (
+                StatusCode::OK,
+                Json(json!({
+                    "ok": true,
+                    "source": "history",
+                    "transaction": transaction
+                })),
+            ),
+            Err(error) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({
+                    "ok": false,
+                    "error": format!("历史交易反序列化失败: {error}")
+                })),
+            ),
+        },
+        Ok(None) => (
+            StatusCode::NOT_FOUND,
+            Json(json!({
+                "ok": false,
+                "error": format!("交易不存在: {tx_id}")
             })),
         ),
         Err((status, body)) => (status, Json(body)),
@@ -3388,6 +3454,95 @@ mod tests {
 
         assert_eq!(status, StatusCode::NOT_FOUND);
         assert_eq!(body["ok"], json!(false));
+    }
+
+    /// 验证统一交易查询会优先命中待打包交易。
+    #[tokio::test]
+    async fn chain_tx_query_should_return_pending_first() {
+        let app = build_test_app();
+        let (alice_wallet, alice_key_pair) = create_wallet("alice-pass").expect("创建钱包应成功");
+        let (bob_wallet, _) = create_wallet("bob-pass").expect("创建钱包应成功");
+
+        let _ = send_json(
+            &app,
+            Method::POST,
+            "/chain/mine",
+            json!({ "miner_address": alice_wallet.address.clone() }),
+        )
+        .await;
+
+        let mut tx = Transaction::new(
+            alice_wallet.address.clone(),
+            bob_wallet.address.clone(),
+            6,
+            Some(b"chain-tx-query-pending".to_vec()),
+        );
+        tx.sign_with_private_key(&alice_key_pair.private_key, &alice_key_pair.public_key)
+            .expect("签名应成功");
+        let tx_id = tx.id.clone();
+
+        let _ = send_json(
+            &app,
+            Method::POST,
+            "/chain/tx",
+            json!({ "transaction": tx }),
+        )
+        .await;
+
+        let path = format!("/chain/tx/{tx_id}");
+        let (status, body) = send_empty(&app, Method::GET, &path).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["ok"], json!(true));
+        assert_eq!(body["source"], json!("pending"));
+        assert_eq!(body["transaction"]["id"], json!(tx_id));
+    }
+
+    /// 验证统一交易查询可回退命中历史交易。
+    #[tokio::test]
+    async fn chain_tx_query_should_fallback_to_history() {
+        let app = build_test_app();
+        let (alice_wallet, alice_key_pair) = create_wallet("alice-pass").expect("创建钱包应成功");
+        let (bob_wallet, _) = create_wallet("bob-pass").expect("创建钱包应成功");
+
+        let _ = send_json(
+            &app,
+            Method::POST,
+            "/chain/mine",
+            json!({ "miner_address": alice_wallet.address.clone() }),
+        )
+        .await;
+
+        let mut tx = Transaction::new(
+            alice_wallet.address.clone(),
+            bob_wallet.address.clone(),
+            4,
+            Some(b"chain-tx-query-history".to_vec()),
+        );
+        tx.sign_with_private_key(&alice_key_pair.private_key, &alice_key_pair.public_key)
+            .expect("签名应成功");
+        let tx_id = tx.id.clone();
+
+        let _ = send_json(
+            &app,
+            Method::POST,
+            "/chain/tx",
+            json!({ "transaction": tx }),
+        )
+        .await;
+        let _ = send_json(
+            &app,
+            Method::POST,
+            "/chain/mine",
+            json!({ "miner_address": "history-miner" }),
+        )
+        .await;
+
+        let path = format!("/chain/tx/{tx_id}");
+        let (status, body) = send_empty(&app, Method::GET, &path).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["ok"], json!(true));
+        assert_eq!(body["source"], json!("history"));
+        assert_eq!(body["transaction"]["id"], json!(tx_id));
     }
 
     /// 验证提交非法合约脚本交易时会被链交易接口拒绝。
