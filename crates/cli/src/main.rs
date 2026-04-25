@@ -160,13 +160,18 @@ fn run_sign_demo(args: &[String]) -> AppResult<()> {
 
 /// 处理健康检查相关命令（通过 API 调用）。
 fn handle_health_command(config: &AppConfig, args: &[String]) -> AppResult<()> {
-    let (path, label) = match args.get(1).map(String::as_str) {
-        None => ("/health", "health"),
-        Some("live") => ("/health/live", "health_live"),
-        Some("ready") => ("/health/ready", "health_ready"),
-        Some(other) => {
+    let mode = args.get(1).map(String::as_str).unwrap_or("base");
+    let (path, label) = match mode {
+        "base" => ("/health", "health"),
+        "live" => ("/health/live", "health_live"),
+        "ready" => ("/health/ready", "health_ready"),
+        "metrics" => {
+            let text = call_api_text(config, Method::GET, "/metrics")?;
+            return print_text("health_metrics", &text);
+        }
+        other => {
             return Err(AppError::Command(format!(
-                "未知 health 子命令: {other}，可用: live/ready"
+                "未知 health 子命令: {other}，可用: live/ready/metrics"
             )))
         }
     };
@@ -852,6 +857,13 @@ fn print_json(label: &str, value: Value) -> AppResult<()> {
     Ok(())
 }
 
+/// 打印文本结果。
+fn print_text(label: &str, value: &str) -> AppResult<()> {
+    println!("{label}:");
+    println!("{value}");
+    Ok(())
+}
+
 /// 调用 API 并返回 JSON 结果。
 fn call_api_json(
     config: &AppConfig,
@@ -890,6 +902,28 @@ fn call_api_json(
             .unwrap_or_else(|| body_json.to_string());
         Err(AppError::Command(format!(
             "API 返回错误({status}): {message}"
+        )))
+    }
+}
+
+/// 调用 API 并返回文本结果。
+fn call_api_text(config: &AppConfig, method: Method, path: &str) -> AppResult<String> {
+    let client = Client::new();
+    let url = format!("{}{}", api_base_url(config), path);
+    let response = client
+        .request(method, &url)
+        .send()
+        .map_err(|error| AppError::Command(format!("调用 API 失败: {error}")))?;
+    let status = response.status();
+    let body_text = response
+        .text()
+        .map_err(|error| AppError::Command(format!("读取 API 响应失败: {error}")))?;
+
+    if status.is_success() {
+        Ok(body_text)
+    } else {
+        Err(AppError::Command(format!(
+            "API 返回错误({status}): {body_text}"
         )))
     }
 }
@@ -1147,7 +1181,7 @@ fn print_help() {
     println!("用法:");
     println!("  rustchain-cli wallet create <password>");
     println!("  rustchain-cli tx sign-demo [amount]");
-    println!("  rustchain-cli health [live|ready]");
+    println!("  rustchain-cli health [live|ready|metrics]");
     println!("  rustchain-cli chain info");
     println!("  rustchain-cli chain validate");
     println!("  rustchain-cli chain latest-block");

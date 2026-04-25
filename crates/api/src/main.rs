@@ -134,10 +134,11 @@ async fn health_ready_handler(
 async fn metrics_handler(
     State(state): State<AppState>,
 ) -> (StatusCode, [(header::HeaderName, &'static str); 1], String) {
-    let (chain_height, pending_tx_count, peer_count, difficulty) =
+    let (chain_id, chain_height, pending_tx_count, peer_count, difficulty) =
         match with_chain(&state, |chain| {
             let latest = chain.latest_block()?;
             Ok((
+                chain.chain_id.clone(),
                 latest.index,
                 chain.pending_transactions.len(),
                 chain.peers.len(),
@@ -159,6 +160,12 @@ async fn metrics_handler(
         "# HELP rustchain_up Whether rustchain api process is up.\n\
 # TYPE rustchain_up gauge\n\
 rustchain_up 1\n\
+# HELP rustchain_build_info Build info labeled by service version.\n\
+# TYPE rustchain_build_info gauge\n\
+rustchain_build_info{{version=\"{}\"}} 1\n\
+# HELP rustchain_chain_info Chain identity information.\n\
+# TYPE rustchain_chain_info gauge\n\
+rustchain_chain_info{{chain_id=\"{}\"}} 1\n\
 # HELP rustchain_chain_height Current best block height.\n\
 # TYPE rustchain_chain_height gauge\n\
 rustchain_chain_height {chain_height}\n\
@@ -170,7 +177,9 @@ rustchain_pending_tx_count {pending_tx_count}\n\
 rustchain_peer_count {peer_count}\n\
 # HELP rustchain_difficulty Current proof-of-work difficulty.\n\
 # TYPE rustchain_difficulty gauge\n\
-rustchain_difficulty {difficulty}\n"
+rustchain_difficulty {difficulty}\n",
+        env!("CARGO_PKG_VERSION"),
+        chain_id
     );
 
     (
@@ -2916,6 +2925,8 @@ mod tests {
         let (status, body) = send_text(&app, Method::GET, "/metrics").await;
         assert_eq!(status, StatusCode::OK);
         assert!(body.contains("rustchain_up 1"));
+        assert!(body.contains("rustchain_build_info"));
+        assert!(body.contains("rustchain_chain_info{chain_id=\"rustchain-lab-dev\"} 1"));
         assert!(body.contains("rustchain_chain_height 0"));
         assert!(body.contains("rustchain_pending_tx_count 0"));
         assert!(body.contains("rustchain_peer_count 0"));

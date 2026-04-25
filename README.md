@@ -51,6 +51,7 @@ The repository includes helper scripts under `scripts/` for build and deployment
 - `scripts/build_api.sh`: build `rustchain-api` in release mode (RocksDB enabled by default)
 - `scripts/deploy_api.sh`: local process management (`start/stop/restart/status/logs/health [live|ready]/metrics`)
 - `scripts/install_systemd_service.sh`: install and manage a `systemd` service on Linux servers
+- `scripts/backup_data.sh`: data backup/restore for `RUSTCHAIN_DATA_DIR`
 
 ### Quick Start (Local/WSL)
 
@@ -74,6 +75,14 @@ cd /path/to/rustchain-lab
 ./scripts/install_systemd_service.sh logs
 ```
 
+### Data Backup / Restore
+
+```bash
+./scripts/backup_data.sh backup before-upgrade
+./scripts/backup_data.sh list
+./scripts/backup_data.sh restore /path/to/archive.tar.gz
+```
+
 Example environment file:
 
 - `scripts/systemd/rustchain-api.env.example`
@@ -85,6 +94,7 @@ API endpoints:
 - `GET /health`
 - `GET /health/live`
 - `GET /health/ready`
+- `GET /metrics`
 
 CLI probe commands:
 
@@ -92,4 +102,5 @@ CLI probe commands:
 cargo run -q -p rustchain-cli -- health
 cargo run -q -p rustchain-cli -- health live
 cargo run -q -p rustchain-cli -- health ready
+cargo run -q -p rustchain-cli -- health metrics
 ```
