@@ -49,7 +49,7 @@ The project is runnable and deployable in Linux/WSL environments with `cargo` in
 The repository includes helper scripts under `scripts/` for build and deployment:
 
 - `scripts/build_api.sh`: build `rustchain-api` in release mode (RocksDB enabled by default)
-- `scripts/deploy_api.sh`: local process management (`start/stop/restart/status/logs/health`)
+- `scripts/deploy_api.sh`: local process management (`start/stop/restart/status/logs/health [live|ready]`)
 - `scripts/install_systemd_service.sh`: install and manage a `systemd` service on Linux servers
 
 ### Quick Start (Local/WSL)
@@ -59,6 +59,7 @@ cd /path/to/rustchain-lab
 ./scripts/build_api.sh
 ./scripts/deploy_api.sh start
 ./scripts/deploy_api.sh health
+./scripts/deploy_api.sh health live
 ```
 
 ### Quick Start (systemd)
@@ -73,3 +74,19 @@ cd /path/to/rustchain-lab
 Example environment file:
 
 - `scripts/systemd/rustchain-api.env.example`
+
+## Health Probes
+
+API endpoints:
+
+- `GET /health`
+- `GET /health/live`
+- `GET /health/ready`
+
+CLI probe commands:
+
+```bash
+cargo run -q -p rustchain-cli -- health
+cargo run -q -p rustchain-cli -- health live
+cargo run -q -p rustchain-cli -- health ready
+```

@@ -26,7 +26,7 @@ usage() {
   ./scripts/deploy_api.sh restart    # 重启服务
   ./scripts/deploy_api.sh status     # 查看服务状态
   ./scripts/deploy_api.sh logs       # 查看实时日志
-  ./scripts/deploy_api.sh health     # 调用健康检查接口
+  ./scripts/deploy_api.sh health [live|ready]  # 调用探针接口（默认 ready）
 
 可选环境变量:
   RUSTCHAIN_API_HOST          默认 0.0.0.0
@@ -131,7 +131,16 @@ status_service() {
 }
 
 health_check() {
-  curl -fsS "http://127.0.0.1:${API_PORT}/health/ready"
+  local probe="${1:-ready}"
+  local path="/health/ready"
+  if [[ "${probe}" == "live" ]]; then
+    path="/health/live"
+  elif [[ "${probe}" != "ready" ]]; then
+    echo "[deploy] 未知 health 探针: ${probe}，可用: live/ready"
+    exit 1
+  fi
+
+  curl -fsS "http://127.0.0.1:${API_PORT}${path}"
   echo
 }
 
@@ -156,7 +165,7 @@ main() {
       tail -f "${LOG_FILE}"
       ;;
     health)
-      health_check
+      health_check "${2:-ready}"
       ;;
     ""|-h|--help|help)
       usage
