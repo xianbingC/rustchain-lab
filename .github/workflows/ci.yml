@@ -1,0 +1,40 @@
+name: RustChain CI
+
+on:
+  push:
+    branches:
+      - develop
+      - main
+  pull_request:
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install Native Dependencies
+        run: |
+          # RocksDB 编译依赖（含 bindgen 所需 libclang）
+          sudo apt-get update
+          sudo apt-get install -y clang libclang-dev llvm-dev cmake build-essential pkg-config
+
+      - name: Rustfmt Check
+        run: cargo fmt --all --check
+
+      - name: Cargo Check (Workspace)
+        run: cargo check --workspace
+
+      - name: Cargo Test (Workspace)
+        run: cargo test --workspace
+
+      - name: Cargo Check (API with RocksDB Feature)
+        run: cargo check -p rustchain-api --features rocksdb-backend

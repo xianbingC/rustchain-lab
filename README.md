@@ -44,6 +44,14 @@ This project follows a six-week plan with four hours per day and five days per w
 
 The project is runnable and deployable in Linux/WSL environments with `cargo` installed. Core modules, API/CLI flows, and DeFi/NFT demos are available for end-to-end testing.
 
+## CI
+
+GitHub Actions workflow is provided at:
+
+- `.github/workflows/ci.yml`
+
+It runs `fmt/check/test` on workspace and verifies `rustchain-api` with `rocksdb-backend`.
+
 ## Deployment Scripts
 
 The repository includes helper scripts under `scripts/` for build and deployment:
@@ -52,6 +60,7 @@ The repository includes helper scripts under `scripts/` for build and deployment
 - `scripts/deploy_api.sh`: local process management (`start/stop/restart/status/logs/health [live|ready]/metrics`)
 - `scripts/install_systemd_service.sh`: install and manage a `systemd` service on Linux servers
 - `scripts/backup_data.sh`: data backup/restore for `RUSTCHAIN_DATA_DIR`
+- `scripts/multi_node_check.sh`: dual-node smoke checks (probe/metrics/chain/p2p)
 
 ### Quick Start (Local/WSL)
 
@@ -81,6 +90,14 @@ cd /path/to/rustchain-lab
 ./scripts/backup_data.sh backup before-upgrade
 ./scripts/backup_data.sh list
 ./scripts/backup_data.sh restore /path/to/archive.tar.gz
+```
+
+### Multi-node Smoke Check
+
+```bash
+./scripts/multi_node_check.sh smoke
+./scripts/multi_node_check.sh register
+./scripts/multi_node_check.sh full
 ```
 
 Example environment file:
