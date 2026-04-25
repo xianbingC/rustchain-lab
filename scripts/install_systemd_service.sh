@@ -45,6 +45,7 @@ usage() {
   ./scripts/install_systemd_service.sh logs        # 实时查看日志
   ./scripts/install_systemd_service.sh health [live|ready] # 调用探针接口（默认 ready）
   ./scripts/install_systemd_service.sh metrics     # 查看 Prometheus 指标
+  ./scripts/install_systemd_service.sh difficulty  # 查看链难度详情
   ./scripts/install_systemd_service.sh uninstall   # 卸载服务（保留数据目录）
 
 常用环境变量:
@@ -207,6 +208,11 @@ metrics_service() {
   curl -fsS "http://127.0.0.1:${API_PORT}/metrics"
 }
 
+difficulty_service() {
+  curl -fsS "http://127.0.0.1:${API_PORT}/chain/difficulty"
+  echo
+}
+
 uninstall_service() {
   ensure_dependency
   echo "[systemd] 卸载服务: ${SERVICE_NAME}"
@@ -244,6 +250,9 @@ main() {
       ;;
     metrics)
       metrics_service
+      ;;
+    difficulty)
+      difficulty_service
       ;;
     uninstall)
       uninstall_service

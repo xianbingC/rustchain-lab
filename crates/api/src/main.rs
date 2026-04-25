@@ -138,27 +138,35 @@ async fn health_ready_handler(
 async fn metrics_handler(
     State(state): State<AppState>,
 ) -> (StatusCode, [(header::HeaderName, &'static str); 1], String) {
-    let (chain_id, chain_height, pending_tx_count, peer_count, difficulty) =
-        match with_chain(&state, |chain| {
-            let latest = chain.latest_block()?;
-            Ok((
-                chain.chain_id.clone(),
-                latest.index,
-                chain.pending_transactions.len(),
-                chain.peers.len(),
-                chain.difficulty,
-            ))
-        }) {
-            Ok(metrics) => metrics,
-            Err((status, body)) => {
-                let error = body["error"].as_str().unwrap_or("metrics unavailable");
-                return (
-                    status,
-                    [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
-                    format!("# metrics_error\nrustchain_metrics_error{{reason=\"{error}\"}} 1\n"),
-                );
-            }
-        };
+    let (
+        chain_id,
+        chain_height,
+        pending_tx_count,
+        peer_count,
+        latest_block_difficulty,
+        next_block_expected_difficulty,
+    ) = match with_chain(&state, |chain| {
+        let latest = chain.latest_block()?;
+        let next_difficulty = chain.next_block_expected_difficulty()?;
+        Ok((
+            chain.chain_id.clone(),
+            latest.index,
+            chain.pending_transactions.len(),
+            chain.peers.len(),
+            latest.difficulty,
+            next_difficulty,
+        ))
+    }) {
+        Ok(metrics) => metrics,
+        Err((status, body)) => {
+            let error = body["error"].as_str().unwrap_or("metrics unavailable");
+            return (
+                status,
+                [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
+                format!("# metrics_error\nrustchain_metrics_error{{reason=\"{error}\"}} 1\n"),
+            );
+        }
+    };
 
     let body = format!(
         "# HELP rustchain_up Whether rustchain api process is up.\n\
@@ -179,9 +187,12 @@ rustchain_pending_tx_count {pending_tx_count}\n\
 # HELP rustchain_peer_count Number of connected peers.\n\
 # TYPE rustchain_peer_count gauge\n\
 rustchain_peer_count {peer_count}\n\
-# HELP rustchain_difficulty Current proof-of-work difficulty.\n\
+# HELP rustchain_difficulty Expected proof-of-work difficulty for next block.\n\
 # TYPE rustchain_difficulty gauge\n\
-rustchain_difficulty {difficulty}\n",
+rustchain_difficulty {next_block_expected_difficulty}\n\
+# HELP rustchain_latest_block_difficulty Difficulty recorded on latest block.\n\
+# TYPE rustchain_latest_block_difficulty gauge\n\
+rustchain_latest_block_difficulty {latest_block_difficulty}\n",
         env!("CARGO_PKG_VERSION"),
         chain_id
     );
@@ -271,8 +282,12 @@ struct ChainInfoResponse {
     height: u64,
     /// 最新区块哈希。
     latest_hash: String,
-    /// 当前难度。
+    /// 当前难度（兼容字段，等价于下一块期望难度）。
     difficulty: u32,
+    /// 下一块期望难度。
+    next_block_expected_difficulty: u32,
+    /// 最新区块记录的难度。
+    latest_block_difficulty: u32,
     /// 目标出块时间（秒）。
     target_block_time_secs: u64,
     /// 难度调整窗口（每隔 N 个区块尝试调整一次）。
@@ -281,6 +296,21 @@ struct ChainInfoResponse {
     pending_tx_count: usize,
     /// 已连接节点数量。
     peer_count: usize,
+}
+
+/// 难度详情响应。
+#[derive(Debug, Serialize)]
+struct ChainDifficultyResponse {
+    /// 当前链高度。
+    height: u64,
+    /// 最新区块记录的难度。
+    latest_block_difficulty: u32,
+    /// 下一块期望难度。
+    next_block_expected_difficulty: u32,
+    /// 目标出块时间（秒）。
+    target_block_time_secs: u64,
+    /// 难度调整窗口（每隔 N 个区块尝试调整一次）。
+    difficulty_adjustment_interval: u64,
 }
 
 /// 交易池查询参数。
@@ -474,11 +504,14 @@ fn chain_status_from_blockchain(chain: &Blockchain) -> ChainStatus {
         .latest_block()
         .cloned()
         .unwrap_or_else(|_| Block::genesis());
+    let next_difficulty = chain
+        .next_block_expected_difficulty()
+        .unwrap_or(chain.difficulty);
     ChainStatus {
         chain_id: chain.chain_id.clone(),
         best_height: latest.index,
         best_hash: latest.hash,
-        difficulty: chain.difficulty,
+        difficulty: next_difficulty,
         genesis_hash: Block::genesis().hash,
     }
 }
@@ -497,6 +530,7 @@ fn build_app(shared_state: AppState) -> Router {
         .route("/p2p/peer/register", post(p2p_register_peer_handler))
         .route("/p2p/message", post(p2p_message_handler))
         .route("/chain/info", get(chain_info_handler))
+        .route("/chain/difficulty", get(chain_difficulty_handler))
         .route("/chain/validate", get(chain_validate_handler))
         .route("/chain/block/latest", get(chain_latest_block_handler))
         .route("/chain/blocks", get(chain_blocks_handler))
@@ -875,11 +909,14 @@ async fn chain_info_handler(
 ) -> (StatusCode, Json<serde_json::Value>) {
     match with_chain(&state, |chain| {
         let latest = chain.latest_block()?;
+        let next_difficulty = chain.next_block_expected_difficulty()?;
         let info = ChainInfoResponse {
             chain_id: chain.chain_id.clone(),
             height: latest.index,
             latest_hash: latest.hash.clone(),
-            difficulty: chain.difficulty,
+            difficulty: next_difficulty,
+            next_block_expected_difficulty: next_difficulty,
+            latest_block_difficulty: latest.difficulty,
             target_block_time_secs: chain.target_block_time_secs,
             difficulty_adjustment_interval: chain.difficulty_adjustment_interval,
             pending_tx_count: chain.pending_transactions.len(),
@@ -888,6 +925,29 @@ async fn chain_info_handler(
         Ok(json!({
             "ok": true,
             "chain": info
+        }))
+    }) {
+        Ok(body) => (StatusCode::OK, Json(body)),
+        Err((status, body)) => (status, Json(body)),
+    }
+}
+
+/// 链难度详情查询接口。
+async fn chain_difficulty_handler(
+    State(state): State<AppState>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    match with_chain(&state, |chain| {
+        let latest = chain.latest_block()?;
+        let info = ChainDifficultyResponse {
+            height: latest.index,
+            latest_block_difficulty: latest.difficulty,
+            next_block_expected_difficulty: chain.next_block_expected_difficulty()?,
+            target_block_time_secs: chain.target_block_time_secs,
+            difficulty_adjustment_interval: chain.difficulty_adjustment_interval,
+        };
+        Ok(json!({
+            "ok": true,
+            "difficulty": info
         }))
     }) {
         Ok(body) => (StatusCode::OK, Json(body)),
@@ -2943,6 +3003,7 @@ mod tests {
         assert!(body.contains("rustchain_pending_tx_count 0"));
         assert!(body.contains("rustchain_peer_count 0"));
         assert!(body.contains("rustchain_difficulty 2"));
+        assert!(body.contains("rustchain_latest_block_difficulty 0"));
     }
 
     /// 验证链信息、交易提交、挖矿和余额查询主流程。
@@ -2955,6 +3016,9 @@ mod tests {
         let (status, body) = send_empty(&app, Method::GET, "/chain/info").await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body["chain"]["height"], json!(0));
+        assert_eq!(body["chain"]["difficulty"], json!(2));
+        assert_eq!(body["chain"]["next_block_expected_difficulty"], json!(2));
+        assert_eq!(body["chain"]["latest_block_difficulty"], json!(0));
         assert_eq!(body["chain"]["target_block_time_secs"], json!(10));
         assert_eq!(body["chain"]["difficulty_adjustment_interval"], json!(10));
 
@@ -3026,6 +3090,26 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body["balance"], json!(20));
+    }
+
+    /// 验证链难度详情接口返回最新难度和下一块难度。
+    #[tokio::test]
+    async fn chain_difficulty_endpoint_should_work() {
+        let app = build_test_app();
+
+        let (status, body) = send_empty(&app, Method::GET, "/chain/difficulty").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["difficulty"]["height"], json!(0));
+        assert_eq!(body["difficulty"]["latest_block_difficulty"], json!(0));
+        assert_eq!(
+            body["difficulty"]["next_block_expected_difficulty"],
+            json!(2)
+        );
+        assert_eq!(body["difficulty"]["target_block_time_secs"], json!(10));
+        assert_eq!(
+            body["difficulty"]["difficulty_adjustment_interval"],
+            json!(10)
+        );
     }
 
     /// 验证交易池查询支持返回完整列表和 limit 截断。

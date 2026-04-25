@@ -71,6 +71,7 @@ cd /path/to/rustchain-lab
 ./scripts/deploy_api.sh health
 ./scripts/deploy_api.sh health live
 ./scripts/deploy_api.sh metrics
+./scripts/deploy_api.sh difficulty
 ```
 
 ### Quick Start (systemd)
@@ -81,6 +82,7 @@ cd /path/to/rustchain-lab
 ./scripts/install_systemd_service.sh status
 ./scripts/install_systemd_service.sh health
 ./scripts/install_systemd_service.sh metrics
+./scripts/install_systemd_service.sh difficulty
 ./scripts/install_systemd_service.sh logs
 ```
 
@@ -119,6 +121,7 @@ API endpoints:
 - `GET /health/live`
 - `GET /health/ready`
 - `GET /metrics`
+- `GET /chain/difficulty`
 
 CLI probe commands:
 
@@ -127,4 +130,5 @@ cargo run -q -p rustchain-cli -- health
 cargo run -q -p rustchain-cli -- health live
 cargo run -q -p rustchain-cli -- health ready
 cargo run -q -p rustchain-cli -- health metrics
+cargo run -q -p rustchain-cli -- chain difficulty
 ```

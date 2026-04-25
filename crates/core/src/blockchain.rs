@@ -66,6 +66,17 @@ impl Blockchain {
         self.chain.last().ok_or(CoreError::EmptyChain)
     }
 
+    /// 返回最新已确认区块的挖矿难度。
+    pub fn latest_block_difficulty(&self) -> CoreResult<u32> {
+        Ok(self.latest_block()?.difficulty)
+    }
+
+    /// 返回下一块区块的期望挖矿难度。
+    pub fn next_block_expected_difficulty(&self) -> CoreResult<u32> {
+        let latest = self.latest_block()?;
+        self.expected_difficulty_for_height(latest.index + 1)
+    }
+
     /// 添加一个已知对等节点。
     pub fn add_peer(&mut self, peer: impl Into<String>) {
         let peer = peer.into();
@@ -739,5 +750,34 @@ mod tests {
         assert_eq!(Blockchain::adjust_difficulty_with_elapsed(2, 4, 20), 3);
         assert_eq!(Blockchain::adjust_difficulty_with_elapsed(2, 50, 20), 1);
         assert_eq!(Blockchain::adjust_difficulty_with_elapsed(2, 15, 20), 2);
+    }
+
+    /// 验证可查询最新区块难度与下一块期望难度。
+    #[test]
+    fn difficulty_query_methods_should_work() {
+        let mut blockchain = Blockchain::new(2, 50);
+        assert_eq!(
+            blockchain
+                .next_block_expected_difficulty()
+                .expect("应可计算下一块难度"),
+            2
+        );
+        assert_eq!(
+            blockchain
+                .latest_block_difficulty()
+                .expect("应可读取最新区块难度"),
+            0
+        );
+
+        let block = blockchain
+            .mine_pending_transactions("miner-q")
+            .expect("挖矿应成功");
+        assert_eq!(block.difficulty, 2);
+        assert_eq!(
+            blockchain
+                .latest_block_difficulty()
+                .expect("应可读取最新区块难度"),
+            2
+        );
     }
 }

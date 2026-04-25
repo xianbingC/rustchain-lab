@@ -28,6 +28,7 @@ usage() {
   ./scripts/deploy_api.sh logs       # 查看实时日志
   ./scripts/deploy_api.sh health [live|ready]  # 调用探针接口（默认 ready）
   ./scripts/deploy_api.sh metrics    # 查看 Prometheus 指标
+  ./scripts/deploy_api.sh difficulty # 查看链难度详情
 
 可选环境变量:
   RUSTCHAIN_API_HOST          默认 0.0.0.0
@@ -149,6 +150,11 @@ metrics_check() {
   curl -fsS "http://127.0.0.1:${API_PORT}/metrics"
 }
 
+difficulty_check() {
+  curl -fsS "http://127.0.0.1:${API_PORT}/chain/difficulty"
+  echo
+}
+
 main() {
   local cmd="${1:-}"
   case "${cmd}" in
@@ -174,6 +180,9 @@ main() {
       ;;
     metrics)
       metrics_check
+      ;;
+    difficulty)
+      difficulty_check
       ;;
     ""|-h|--help|help)
       usage
