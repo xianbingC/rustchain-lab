@@ -104,6 +104,13 @@ Example environment file:
 
 - `scripts/systemd/rustchain-api.env.example`
 
+Key chain tuning variables:
+
+- `RUSTCHAIN_MINING_DIFFICULTY`
+- `RUSTCHAIN_MINING_REWARD`
+- `RUSTCHAIN_TARGET_BLOCK_TIME_SECS`
+- `RUSTCHAIN_DIFFICULTY_ADJUSTMENT_INTERVAL`
+
 ## Health Probes
 
 API endpoints:

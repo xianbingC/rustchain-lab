@@ -63,6 +63,10 @@ async fn run() -> AppResult<()> {
         app = %config.app_name,
         listen_addr = %listen_addr,
         p2p_bind_addr = %config.p2p_bind_addr,
+        difficulty = config.mining_difficulty,
+        reward = config.mining_reward,
+        target_block_time_secs = config.target_block_time_secs,
+        difficulty_adjustment_interval = config.difficulty_adjustment_interval,
         "API 服务启动成功"
     );
 
@@ -269,6 +273,10 @@ struct ChainInfoResponse {
     latest_hash: String,
     /// 当前难度。
     difficulty: u32,
+    /// 目标出块时间（秒）。
+    target_block_time_secs: u64,
+    /// 难度调整窗口（每隔 N 个区块尝试调整一次）。
+    difficulty_adjustment_interval: u64,
     /// 交易池数量。
     pending_tx_count: usize,
     /// 已连接节点数量。
@@ -408,7 +416,9 @@ fn default_app_state() -> AppState {
 
 /// 根据配置构造应用状态。
 fn default_app_state_with_config(config: &AppConfig) -> AppResult<AppState> {
-    let blockchain = Blockchain::new(config.mining_difficulty, config.mining_reward);
+    let mut blockchain = Blockchain::new(config.mining_difficulty, config.mining_reward);
+    blockchain.target_block_time_secs = config.target_block_time_secs;
+    blockchain.difficulty_adjustment_interval = config.difficulty_adjustment_interval;
     let chain_status = chain_status_from_blockchain(&blockchain);
     let local_peer_id = format!("{}-node", config.app_name);
     let state_store = open_state_store(config)?;
@@ -870,6 +880,8 @@ async fn chain_info_handler(
             height: latest.index,
             latest_hash: latest.hash.clone(),
             difficulty: chain.difficulty,
+            target_block_time_secs: chain.target_block_time_secs,
+            difficulty_adjustment_interval: chain.difficulty_adjustment_interval,
             pending_tx_count: chain.pending_transactions.len(),
             peer_count: chain.peers.len(),
         };
@@ -2943,6 +2955,8 @@ mod tests {
         let (status, body) = send_empty(&app, Method::GET, "/chain/info").await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body["chain"]["height"], json!(0));
+        assert_eq!(body["chain"]["target_block_time_secs"], json!(10));
+        assert_eq!(body["chain"]["difficulty_adjustment_interval"], json!(10));
 
         let (status, _) = send_json(
             &app,

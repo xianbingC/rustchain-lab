@@ -27,6 +27,8 @@ fn run() -> AppResult<()> {
         data_dir = %config.data_dir,
         difficulty = config.mining_difficulty,
         reward = config.mining_reward,
+        target_block_time_secs = config.target_block_time_secs,
+        difficulty_adjustment_interval = config.difficulty_adjustment_interval,
         "CLI 初始化完成"
     );
 
@@ -1262,6 +1264,8 @@ mod tests {
             data_dir: "./data".to_string(),
             mining_difficulty: 2,
             mining_reward: 50,
+            target_block_time_secs: 10,
+            difficulty_adjustment_interval: 10,
         };
 
         assert_eq!(api_base_url(&config), "http://127.0.0.1:8088");

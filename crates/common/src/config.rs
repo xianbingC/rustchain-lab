@@ -1,6 +1,4 @@
-use crate::{
-    error::{AppError, AppResult},
-};
+use crate::error::{AppError, AppResult};
 use serde::{Deserialize, Serialize};
 use std::env;
 
@@ -25,6 +23,10 @@ pub struct AppConfig {
     pub mining_difficulty: u32,
     /// 出块奖励。
     pub mining_reward: u64,
+    /// 目标出块时间（秒）。
+    pub target_block_time_secs: u64,
+    /// 难度调整窗口（每隔 N 个区块尝试调整一次）。
+    pub difficulty_adjustment_interval: u64,
 }
 
 impl AppConfig {
@@ -42,6 +44,11 @@ impl AppConfig {
             data_dir: env_or_default("RUSTCHAIN_DATA_DIR", "./data"),
             mining_difficulty: parse_env_or_default("RUSTCHAIN_MINING_DIFFICULTY", 2)?,
             mining_reward: parse_env_or_default("RUSTCHAIN_MINING_REWARD", 50)?,
+            target_block_time_secs: parse_env_or_default("RUSTCHAIN_TARGET_BLOCK_TIME_SECS", 10)?,
+            difficulty_adjustment_interval: parse_env_or_default(
+                "RUSTCHAIN_DIFFICULTY_ADJUSTMENT_INTERVAL",
+                10,
+            )?,
         })
     }
 
@@ -63,9 +70,9 @@ where
     T::Err: std::fmt::Display,
 {
     match env::var(key) {
-        Ok(value) => value.parse::<T>().map_err(|error| {
-            AppError::Config(format!("{key} 解析失败: {error}"))
-        }),
+        Ok(value) => value
+            .parse::<T>()
+            .map_err(|error| AppError::Config(format!("{key} 解析失败: {error}"))),
         Err(_) => Ok(default),
     }
 }
@@ -95,5 +102,7 @@ mod tests {
         assert_eq!(config.api_port, 8080);
         assert_eq!(config.mining_difficulty, 2);
         assert_eq!(config.mining_reward, 50);
+        assert_eq!(config.target_block_time_secs, 10);
+        assert_eq!(config.difficulty_adjustment_interval, 10);
     }
 }

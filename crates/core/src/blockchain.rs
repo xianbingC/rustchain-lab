@@ -7,6 +7,9 @@ use crate::{
 use rustchain_vm::{compiler::compile, runtime::Runtime};
 use std::collections::HashMap;
 
+/// 难度调整间隔默认值（按区块高度计）。
+const DEFAULT_DIFFICULTY_ADJUSTMENT_INTERVAL: u64 = 10;
+
 /// 区块链聚合结构，维护主链、交易池和已连接节点信息。
 #[derive(Debug, Clone)]
 pub struct Blockchain {
@@ -20,10 +23,14 @@ pub struct Blockchain {
     pub peers: Vec<String>,
     /// 当前 PoW 难度。
     pub difficulty: u32,
+    /// 初始难度，作为第一块（非创世区块）难度基线。
+    initial_difficulty: u32,
     /// 出块奖励。
     pub mining_reward: u64,
-    /// 目标出块时间（秒），用于后续动态难度调整。
+    /// 目标出块时间（秒），用于动态难度调整。
     pub target_block_time_secs: u64,
+    /// 难度调整窗口（每隔 N 个区块尝试调整一次）。
+    pub difficulty_adjustment_interval: u64,
     /// 合约状态快照，key 为合约地址。
     pub contract_states: HashMap<String, HashMap<String, i64>>,
     /// 合约事件日志，key 为合约地址。
@@ -45,8 +52,10 @@ impl Blockchain {
             pending_transactions: Vec::new(),
             peers: Vec::new(),
             difficulty,
+            initial_difficulty: difficulty,
             mining_reward,
             target_block_time_secs: 10,
+            difficulty_adjustment_interval: DEFAULT_DIFFICULTY_ADJUSTMENT_INTERVAL,
             contract_states: HashMap::new(),
             contract_events: HashMap::new(),
         }
@@ -105,19 +114,21 @@ impl Blockchain {
         block_transactions.push(reward_tx);
 
         let previous_block = self.latest_block()?;
+        let expected_difficulty = self.expected_difficulty_for_height(previous_block.index + 1)?;
         let mut candidate_block = Block::new(
             previous_block.index + 1,
             block_transactions,
             previous_block.hash.clone(),
-            self.difficulty,
+            expected_difficulty,
             miner_address,
         );
-        candidate_block.mine(self.difficulty);
+        candidate_block.mine(expected_difficulty);
 
         self.validate_next_block(&candidate_block)?;
         self.apply_contract_state_transitions(&candidate_block.transactions)?;
         self.chain.push(candidate_block.clone());
         self.pending_transactions.clear();
+        self.refresh_next_difficulty_cache();
 
         Ok(candidate_block)
     }
@@ -127,6 +138,7 @@ impl Blockchain {
         self.validate_next_block(&block)?;
         self.apply_contract_state_transitions(&block.transactions)?;
         self.chain.push(block.clone());
+        self.refresh_next_difficulty_cache();
 
         // 将已确认区块中的交易从待打包池移除，避免重复打包。
         let confirmed_ids = block
@@ -177,10 +189,11 @@ impl Blockchain {
                     return Err(CoreError::InvalidPreviousHash { index: block.index });
                 }
 
-                if block.difficulty != self.difficulty {
+                let expected_difficulty = self.expected_difficulty_for_height(block.index)?;
+                if block.difficulty != expected_difficulty {
                     return Err(CoreError::InvalidBlockDifficulty {
                         index: block.index,
-                        expected: self.difficulty,
+                        expected: expected_difficulty,
                         actual: block.difficulty,
                     });
                 }
@@ -208,10 +221,11 @@ impl Blockchain {
             return Err(CoreError::InvalidPreviousHash { index: block.index });
         }
 
-        if block.difficulty != self.difficulty {
+        let expected_difficulty = self.expected_difficulty_for_height(block.index)?;
+        if block.difficulty != expected_difficulty {
             return Err(CoreError::InvalidBlockDifficulty {
                 index: block.index,
-                expected: self.difficulty,
+                expected: expected_difficulty,
                 actual: block.difficulty,
             });
         }
@@ -220,6 +234,87 @@ impl Blockchain {
         self.apply_transactions_to_balances(&block.transactions, &mut balances)?;
 
         Ok(())
+    }
+
+    /// 计算指定高度区块的期望难度。
+    fn expected_difficulty_for_height(&self, height: u64) -> CoreResult<u32> {
+        if height == 0 {
+            return Ok(0);
+        }
+        if height == 1 {
+            return Ok(self.initial_difficulty);
+        }
+
+        let previous_position = (height - 1) as usize;
+        let previous_block = self
+            .chain
+            .get(previous_position)
+            .ok_or(CoreError::EmptyChain)?;
+        if self.difficulty_adjustment_interval <= 1
+            || height % self.difficulty_adjustment_interval != 0
+        {
+            return Ok(previous_block.difficulty);
+        }
+
+        let interval = self.difficulty_adjustment_interval;
+        if height < interval {
+            return Ok(previous_block.difficulty);
+        }
+
+        let start_position = (height - interval) as usize;
+        let Some(start_block) = self.chain.get(start_position) else {
+            return Ok(previous_block.difficulty);
+        };
+
+        // 创世区块时间戳固定为 0，不参与首轮难度估算。
+        if start_block.index == 0 {
+            return Ok(previous_block.difficulty);
+        }
+
+        let elapsed_secs = previous_block
+            .timestamp
+            .saturating_sub(start_block.timestamp)
+            .max(1) as u64;
+        let expected_elapsed_secs = self
+            .target_block_time_secs
+            .saturating_mul(interval.saturating_sub(1).max(1));
+
+        Ok(Self::adjust_difficulty_with_elapsed(
+            previous_block.difficulty,
+            elapsed_secs,
+            expected_elapsed_secs,
+        ))
+    }
+
+    /// 基于时间窗口调整难度，快则上调、慢则下调。
+    fn adjust_difficulty_with_elapsed(
+        previous_difficulty: u32,
+        elapsed_secs: u64,
+        expected_elapsed_secs: u64,
+    ) -> u32 {
+        if expected_elapsed_secs == 0 {
+            return previous_difficulty;
+        }
+
+        let lower_bound = expected_elapsed_secs.saturating_div(2).max(1);
+        let upper_bound = expected_elapsed_secs.saturating_mul(2);
+        if elapsed_secs < lower_bound {
+            previous_difficulty.saturating_add(1)
+        } else if elapsed_secs > upper_bound {
+            previous_difficulty.saturating_sub(1)
+        } else {
+            previous_difficulty
+        }
+    }
+
+    /// 刷新缓存难度，保证接口对外展示当前下一块的目标难度。
+    fn refresh_next_difficulty_cache(&mut self) {
+        if let Ok(next_difficulty) = self
+            .latest_block()
+            .and_then(|latest| self.expected_difficulty_for_height(latest.index + 1))
+        {
+            self.difficulty = next_difficulty;
+        }
     }
 
     /// 顺序执行交易对余额的影响，保证同一区块内的余额检查是有状态的。
@@ -609,5 +704,40 @@ mod tests {
             local_chain.latest_block().expect("应存在最新区块").hash,
             block.hash
         );
+    }
+
+    /// 验证动态难度会在调整窗口命中时上调。
+    #[test]
+    fn difficulty_should_increase_on_fast_blocks_at_adjustment_boundary() {
+        let mut blockchain = Blockchain::new(1, 50);
+        blockchain.target_block_time_secs = 100;
+        blockchain.difficulty_adjustment_interval = 2;
+
+        let block1 = blockchain
+            .mine_pending_transactions("miner-1")
+            .expect("第一块挖矿应成功");
+        let block2 = blockchain
+            .mine_pending_transactions("miner-2")
+            .expect("第二块挖矿应成功");
+        let block3 = blockchain
+            .mine_pending_transactions("miner-3")
+            .expect("第三块挖矿应成功");
+        let block4 = blockchain
+            .mine_pending_transactions("miner-4")
+            .expect("第四块挖矿应成功");
+
+        assert_eq!(block1.difficulty, 1);
+        assert_eq!(block2.difficulty, 1);
+        assert_eq!(block3.difficulty, 1);
+        assert_eq!(block4.difficulty, 2);
+        assert_eq!(blockchain.difficulty, 2);
+    }
+
+    /// 验证难度调整函数在快慢窗口下能正确上调或下调。
+    #[test]
+    fn adjust_difficulty_with_elapsed_should_follow_window_rule() {
+        assert_eq!(Blockchain::adjust_difficulty_with_elapsed(2, 4, 20), 3);
+        assert_eq!(Blockchain::adjust_difficulty_with_elapsed(2, 50, 20), 1);
+        assert_eq!(Blockchain::adjust_difficulty_with_elapsed(2, 15, 20), 2);
     }
 }
