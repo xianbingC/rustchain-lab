@@ -1,6 +1,6 @@
 use axum::{
     extract::{Path, Query, State},
-    http::StatusCode,
+    http::{header, StatusCode},
     routing::{get, post},
     Json, Router,
 };
@@ -127,6 +127,59 @@ async fn health_ready_handler(
             "chain_height": chain_height,
             "pending_tx_count": pending_tx_count
         })),
+    )
+}
+
+/// Prometheus 指标接口：输出基础链状态指标。
+async fn metrics_handler(
+    State(state): State<AppState>,
+) -> (StatusCode, [(header::HeaderName, &'static str); 1], String) {
+    let (chain_height, pending_tx_count, peer_count, difficulty) =
+        match with_chain(&state, |chain| {
+            let latest = chain.latest_block()?;
+            Ok((
+                latest.index,
+                chain.pending_transactions.len(),
+                chain.peers.len(),
+                chain.difficulty,
+            ))
+        }) {
+            Ok(metrics) => metrics,
+            Err((status, body)) => {
+                let error = body["error"].as_str().unwrap_or("metrics unavailable");
+                return (
+                    status,
+                    [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
+                    format!("# metrics_error\nrustchain_metrics_error{{reason=\"{error}\"}} 1\n"),
+                );
+            }
+        };
+
+    let body = format!(
+        "# HELP rustchain_up Whether rustchain api process is up.\n\
+# TYPE rustchain_up gauge\n\
+rustchain_up 1\n\
+# HELP rustchain_chain_height Current best block height.\n\
+# TYPE rustchain_chain_height gauge\n\
+rustchain_chain_height {chain_height}\n\
+# HELP rustchain_pending_tx_count Number of pending transactions.\n\
+# TYPE rustchain_pending_tx_count gauge\n\
+rustchain_pending_tx_count {pending_tx_count}\n\
+# HELP rustchain_peer_count Number of connected peers.\n\
+# TYPE rustchain_peer_count gauge\n\
+rustchain_peer_count {peer_count}\n\
+# HELP rustchain_difficulty Current proof-of-work difficulty.\n\
+# TYPE rustchain_difficulty gauge\n\
+rustchain_difficulty {difficulty}\n"
+    );
+
+    (
+        StatusCode::OK,
+        [(
+            header::CONTENT_TYPE,
+            "text/plain; version=0.0.4; charset=utf-8",
+        )],
+        body,
     )
 }
 
@@ -417,6 +470,7 @@ fn build_app(shared_state: AppState) -> Router {
         .route("/health", get(health_handler))
         .route("/health/live", get(health_live_handler))
         .route("/health/ready", get(health_ready_handler))
+        .route("/metrics", get(metrics_handler))
         .route("/wallet/create", post(wallet_create_handler))
         .route("/tx/verify", post(tx_verify_handler))
         .route("/p2p/status", get(p2p_status_handler))
@@ -2855,6 +2909,19 @@ mod tests {
         assert_eq!(body["pending_tx_count"], json!(0));
     }
 
+    /// 验证 Prometheus 指标接口可用。
+    #[tokio::test]
+    async fn metrics_should_return_prometheus_format() {
+        let app = build_test_app();
+        let (status, body) = send_text(&app, Method::GET, "/metrics").await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.contains("rustchain_up 1"));
+        assert!(body.contains("rustchain_chain_height 0"));
+        assert!(body.contains("rustchain_pending_tx_count 0"));
+        assert!(body.contains("rustchain_peer_count 0"));
+        assert!(body.contains("rustchain_difficulty 2"));
+    }
+
     /// 验证链信息、交易提交、挖矿和余额查询主流程。
     #[tokio::test]
     async fn chain_flow_should_work() {
@@ -4706,6 +4773,22 @@ mod tests {
             .body(Body::empty())
             .expect("请求构造应成功");
         send_request(app, request).await
+    }
+
+    /// 发送空载荷请求并读取文本响应。
+    async fn send_text(app: &Router, method: Method, uri: &str) -> (StatusCode, String) {
+        let request = Request::builder()
+            .method(method)
+            .uri(uri)
+            .body(Body::empty())
+            .expect("请求构造应成功");
+        let response = app.clone().oneshot(request).await.expect("请求处理应成功");
+        let status = response.status();
+        let bytes = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("读取响应体应成功");
+        let body = String::from_utf8(bytes.to_vec()).expect("响应应为 UTF-8 文本");
+        (status, body)
     }
 
     /// 发送请求并解析 JSON 响应。

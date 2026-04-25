@@ -43,6 +43,8 @@ usage() {
   ./scripts/install_systemd_service.sh restart     # 重启服务
   ./scripts/install_systemd_service.sh stop        # 停止服务
   ./scripts/install_systemd_service.sh logs        # 实时查看日志
+  ./scripts/install_systemd_service.sh health [live|ready] # 调用探针接口（默认 ready）
+  ./scripts/install_systemd_service.sh metrics     # 查看 Prometheus 指标
   ./scripts/install_systemd_service.sh uninstall   # 卸载服务（保留数据目录）
 
 常用环境变量:
@@ -187,6 +189,24 @@ logs_service() {
   journalctl -u "${SERVICE_NAME}" -f
 }
 
+health_service() {
+  local probe="${1:-ready}"
+  local path="/health/ready"
+  if [[ "${probe}" == "live" ]]; then
+    path="/health/live"
+  elif [[ "${probe}" != "ready" ]]; then
+    echo "[systemd] 未知 health 探针: ${probe}，可用: live/ready"
+    exit 1
+  fi
+
+  curl -fsS "http://127.0.0.1:${API_PORT}${path}"
+  echo
+}
+
+metrics_service() {
+  curl -fsS "http://127.0.0.1:${API_PORT}/metrics"
+}
+
 uninstall_service() {
   ensure_dependency
   echo "[systemd] 卸载服务: ${SERVICE_NAME}"
@@ -218,6 +238,12 @@ main() {
       ;;
     logs)
       logs_service
+      ;;
+    health)
+      health_service "${2:-ready}"
+      ;;
+    metrics)
+      metrics_service
       ;;
     uninstall)
       uninstall_service

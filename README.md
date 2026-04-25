@@ -49,7 +49,7 @@ The project is runnable and deployable in Linux/WSL environments with `cargo` in
 The repository includes helper scripts under `scripts/` for build and deployment:
 
 - `scripts/build_api.sh`: build `rustchain-api` in release mode (RocksDB enabled by default)
-- `scripts/deploy_api.sh`: local process management (`start/stop/restart/status/logs/health [live|ready]`)
+- `scripts/deploy_api.sh`: local process management (`start/stop/restart/status/logs/health [live|ready]/metrics`)
 - `scripts/install_systemd_service.sh`: install and manage a `systemd` service on Linux servers
 
 ### Quick Start (Local/WSL)
@@ -60,6 +60,7 @@ cd /path/to/rustchain-lab
 ./scripts/deploy_api.sh start
 ./scripts/deploy_api.sh health
 ./scripts/deploy_api.sh health live
+./scripts/deploy_api.sh metrics
 ```
 
 ### Quick Start (systemd)
@@ -68,6 +69,8 @@ cd /path/to/rustchain-lab
 cd /path/to/rustchain-lab
 ./scripts/install_systemd_service.sh install
 ./scripts/install_systemd_service.sh status
+./scripts/install_systemd_service.sh health
+./scripts/install_systemd_service.sh metrics
 ./scripts/install_systemd_service.sh logs
 ```
 

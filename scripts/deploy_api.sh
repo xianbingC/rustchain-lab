@@ -27,6 +27,7 @@ usage() {
   ./scripts/deploy_api.sh status     # 查看服务状态
   ./scripts/deploy_api.sh logs       # 查看实时日志
   ./scripts/deploy_api.sh health [live|ready]  # 调用探针接口（默认 ready）
+  ./scripts/deploy_api.sh metrics    # 查看 Prometheus 指标
 
 可选环境变量:
   RUSTCHAIN_API_HOST          默认 0.0.0.0
@@ -144,6 +145,10 @@ health_check() {
   echo
 }
 
+metrics_check() {
+  curl -fsS "http://127.0.0.1:${API_PORT}/metrics"
+}
+
 main() {
   local cmd="${1:-}"
   case "${cmd}" in
@@ -166,6 +171,9 @@ main() {
       ;;
     health)
       health_check "${2:-ready}"
+      ;;
+    metrics)
+      metrics_check
       ;;
     ""|-h|--help|help)
       usage
