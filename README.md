@@ -42,4 +42,34 @@ This project follows a six-week plan with four hours per day and five days per w
 
 ## Current Status
 
-The workspace skeleton and module boundaries are initialized. Rust tooling is not installed in the current local environment yet, so the repository is scaffolded manually and ready to continue in an environment where `cargo` is available.
+The project is runnable and deployable in Linux/WSL environments with `cargo` installed. Core modules, API/CLI flows, and DeFi/NFT demos are available for end-to-end testing.
+
+## Deployment Scripts
+
+The repository includes helper scripts under `scripts/` for build and deployment:
+
+- `scripts/build_api.sh`: build `rustchain-api` in release mode (RocksDB enabled by default)
+- `scripts/deploy_api.sh`: local process management (`start/stop/restart/status/logs/health`)
+- `scripts/install_systemd_service.sh`: install and manage a `systemd` service on Linux servers
+
+### Quick Start (Local/WSL)
+
+```bash
+cd /path/to/rustchain-lab
+./scripts/build_api.sh
+./scripts/deploy_api.sh start
+./scripts/deploy_api.sh health
+```
+
+### Quick Start (systemd)
+
+```bash
+cd /path/to/rustchain-lab
+./scripts/install_systemd_service.sh install
+./scripts/install_systemd_service.sh status
+./scripts/install_systemd_service.sh logs
+```
+
+Example environment file:
+
+- `scripts/systemd/rustchain-api.env.example`
