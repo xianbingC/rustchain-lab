@@ -44,6 +44,7 @@ fn dispatch_command(config: &AppConfig, args: &[String]) -> AppResult<()> {
     match args[0].as_str() {
         "wallet" => handle_wallet_command(args),
         "tx" => handle_tx_command(args),
+        "health" => handle_health_command(config, args),
         "chain" => handle_chain_command(config, args),
         "p2p" => handle_p2p_command(config, args),
         "vm" => handle_vm_command(config, args),
@@ -155,6 +156,23 @@ fn run_sign_demo(args: &[String]) -> AppResult<()> {
             "validated": true
         }),
     )
+}
+
+/// 处理健康检查相关命令（通过 API 调用）。
+fn handle_health_command(config: &AppConfig, args: &[String]) -> AppResult<()> {
+    let (path, label) = match args.get(1).map(String::as_str) {
+        None => ("/health", "health"),
+        Some("live") => ("/health/live", "health_live"),
+        Some("ready") => ("/health/ready", "health_ready"),
+        Some(other) => {
+            return Err(AppError::Command(format!(
+                "未知 health 子命令: {other}，可用: live/ready"
+            )))
+        }
+    };
+
+    let response = call_api_json(config, Method::GET, path, None)?;
+    print_json(label, response)
 }
 
 /// 处理链核心相关命令（通过 API 调用）。
@@ -1129,6 +1147,7 @@ fn print_help() {
     println!("用法:");
     println!("  rustchain-cli wallet create <password>");
     println!("  rustchain-cli tx sign-demo [amount]");
+    println!("  rustchain-cli health [live|ready]");
     println!("  rustchain-cli chain info");
     println!("  rustchain-cli chain validate");
     println!("  rustchain-cli chain latest-block");

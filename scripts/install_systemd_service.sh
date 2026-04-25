@@ -162,7 +162,7 @@ install_service() {
   echo "[systemd] 安装完成。"
   echo "[systemd] 查看状态: systemctl status ${SERVICE_NAME}"
   echo "[systemd] 查看日志: journalctl -u ${SERVICE_NAME} -f"
-  echo "[systemd] 健康检查: curl http://127.0.0.1:${API_PORT}/health"
+  echo "[systemd] 就绪检查: curl http://127.0.0.1:${API_PORT}/health/ready"
 }
 
 status_service() {

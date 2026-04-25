@@ -15,13 +15,13 @@ use rustchain_p2p::{
     engine::{OutboundEnvelope, SyncEngine},
     message::{ChainStatus, NetworkMessage},
 };
+#[cfg(any(test, not(feature = "rocksdb-backend")))]
+use rustchain_storage::state::InMemoryStateStore;
 use rustchain_storage::{
     error::StorageError,
     history::{HistoryStore, LevelDbHistoryStore},
     state::StateStore,
 };
-#[cfg(any(test, not(feature = "rocksdb-backend")))]
-use rustchain_storage::state::InMemoryStateStore;
 use rustchain_vm::{
     compiler::{compile, CompileError},
     runtime::{Runtime, VmError},
@@ -79,6 +79,55 @@ async fn health_handler() -> Json<serde_json::Value> {
         "status": "ok",
         "service": "rustchain-api"
     }))
+}
+
+/// 活性探针接口：用于判断 API 进程是否存活。
+async fn health_live_handler() -> Json<serde_json::Value> {
+    Json(json!({
+        "ok": true,
+        "probe": "live",
+        "service": "rustchain-api"
+    }))
+}
+
+/// 就绪探针接口：用于判断链状态与存储依赖是否可用。
+async fn health_ready_handler(
+    State(state): State<AppState>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let (chain_height, pending_tx_count) = match with_chain(&state, |chain| {
+        let latest = chain.latest_block()?;
+        Ok((latest.index, chain.pending_transactions.len()))
+    }) {
+        Ok(result) => result,
+        Err((status, body)) => return (status, Json(body)),
+    };
+
+    if let Err((status, body)) = with_state_store(&state, |store| {
+        // 读取一个哨兵键，用于验证状态库读路径可用。
+        let _ = store.get_balance("__ready_probe__")?;
+        Ok(())
+    }) {
+        return (status, Json(body));
+    }
+
+    if let Err((status, body)) = with_history(&state, |history| {
+        // 读取一个哨兵键，用于验证历史库读路径可用。
+        let _ = history.get_block("__ready_probe__")?;
+        Ok(())
+    }) {
+        return (status, Json(body));
+    }
+
+    (
+        StatusCode::OK,
+        Json(json!({
+            "ok": true,
+            "probe": "ready",
+            "service": "rustchain-api",
+            "chain_height": chain_height,
+            "pending_tx_count": pending_tx_count
+        })),
+    )
 }
 
 /// 创建钱包请求。
@@ -366,6 +415,8 @@ fn chain_status_from_blockchain(chain: &Blockchain) -> ChainStatus {
 fn build_app(shared_state: AppState) -> Router {
     Router::new()
         .route("/health", get(health_handler))
+        .route("/health/live", get(health_live_handler))
+        .route("/health/ready", get(health_ready_handler))
         .route("/wallet/create", post(wallet_create_handler))
         .route("/tx/verify", post(tx_verify_handler))
         .route("/p2p/status", get(p2p_status_handler))
@@ -2771,6 +2822,38 @@ mod tests {
     use rustchain_crypto::wallet::create_wallet;
     use serde_json::{json, Value};
     use tower::ServiceExt;
+
+    /// 验证基础健康检查接口可用。
+    #[tokio::test]
+    async fn health_should_return_ok() {
+        let app = build_test_app();
+        let (status, body) = send_empty(&app, Method::GET, "/health").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["status"], json!("ok"));
+        assert_eq!(body["service"], json!("rustchain-api"));
+    }
+
+    /// 验证活性探针接口可用。
+    #[tokio::test]
+    async fn health_live_should_return_ok() {
+        let app = build_test_app();
+        let (status, body) = send_empty(&app, Method::GET, "/health/live").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["ok"], json!(true));
+        assert_eq!(body["probe"], json!("live"));
+    }
+
+    /// 验证就绪探针接口可用。
+    #[tokio::test]
+    async fn health_ready_should_return_ok() {
+        let app = build_test_app();
+        let (status, body) = send_empty(&app, Method::GET, "/health/ready").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["ok"], json!(true));
+        assert_eq!(body["probe"], json!("ready"));
+        assert_eq!(body["chain_height"], json!(0));
+        assert_eq!(body["pending_tx_count"], json!(0));
+    }
 
     /// 验证链信息、交易提交、挖矿和余额查询主流程。
     #[tokio::test]

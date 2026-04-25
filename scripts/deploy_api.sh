@@ -87,7 +87,7 @@ start_service() {
   if kill -0 "${pid}" >/dev/null 2>&1; then
     echo "[deploy] 启动成功，PID=${pid}"
     echo "[deploy] 日志文件: ${LOG_FILE}"
-    echo "[deploy] 健康检查: curl http://127.0.0.1:${API_PORT}/health"
+    echo "[deploy] 就绪检查: curl http://127.0.0.1:${API_PORT}/health/ready"
   else
     echo "[deploy] 启动失败，请检查日志: ${LOG_FILE}"
     exit 1
@@ -131,7 +131,7 @@ status_service() {
 }
 
 health_check() {
-  curl -fsS "http://127.0.0.1:${API_PORT}/health"
+  curl -fsS "http://127.0.0.1:${API_PORT}/health/ready"
   echo
 }
 
