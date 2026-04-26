@@ -2,7 +2,7 @@ use crate::{
     codec::MessageCodec,
     error::{P2pError, P2pResult},
     message::{ChainStatus, Handshake, NetworkMessage},
-    peer::{PeerDistance, PeerRegistry, PeerStatus},
+    peer::{DhtBucket, PeerDistance, PeerRegistry, PeerStatus},
     queue::{OrderedMessageQueue, SequencedMessage},
 };
 use serde::{Deserialize, Serialize};
@@ -150,6 +150,22 @@ impl SyncEngine {
         }
 
         Ok(self.peers.nearest_peers(target_peer_id, limit))
+    }
+
+    /// 返回目标节点 ID 对应的 DHT 桶视图。
+    pub fn dht_buckets(&self, target_peer_id: &str, bucket_count: u8) -> P2pResult<Vec<DhtBucket>> {
+        if target_peer_id.trim().is_empty() {
+            return Err(P2pError::InvalidArgument(
+                "target_peer_id 不能为空".to_string(),
+            ));
+        }
+        if bucket_count == 0 {
+            return Err(P2pError::InvalidArgument(
+                "bucket_count 必须大于 0".to_string(),
+            ));
+        }
+
+        Ok(self.peers.dht_buckets(target_peer_id, bucket_count))
     }
 
     /// 为未连接节点构建启动握手消息列表，交由传输层逐个发送。
@@ -455,5 +471,22 @@ mod tests {
         assert_eq!(outbound.len(), 1);
         assert_eq!(outbound[0].target_peer_id, "peer-b");
         assert!(matches!(outbound[0].message, NetworkMessage::Handshake(_)));
+    }
+
+    /// 验证同步引擎可返回 DHT 桶视图。
+    #[test]
+    fn dht_buckets_should_work() {
+        let mut engine = SyncEngine::new("local-node", local_status(2));
+        engine.register_peer("peer-a", "/ip4/127.0.0.1/tcp/7001");
+        engine.register_peer("peer-b", "/ip4/127.0.0.1/tcp/7002");
+        engine.register_peer("peer-c", "/ip4/127.0.0.1/tcp/7003");
+
+        let buckets = engine
+            .dht_buckets("target-peer", 8)
+            .expect("查询 DHT 桶应成功");
+        assert!(!buckets.is_empty());
+        for pair in buckets.windows(2) {
+            assert!(pair[0].bucket_index >= pair[1].bucket_index);
+        }
     }
 }

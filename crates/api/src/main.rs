@@ -273,6 +273,15 @@ struct P2pNearestPeersQuery {
     limit: Option<usize>,
 }
 
+/// P2P DHT 桶查询参数。
+#[derive(Debug, Deserialize)]
+struct P2pDhtBucketsQuery {
+    /// 目标节点 ID。
+    target_peer_id: String,
+    /// 桶数量（默认 16）。
+    bucket_count: Option<u8>,
+}
+
 /// P2P 入站消息请求。
 #[derive(Debug, Deserialize)]
 struct P2pIncomingMessageRequest {
@@ -709,6 +718,7 @@ fn build_app(shared_state: AppState) -> Router {
         .route("/p2p/status", get(p2p_status_handler))
         .route("/p2p/peers", get(p2p_peers_handler))
         .route("/p2p/peers/nearest", get(p2p_nearest_peers_handler))
+        .route("/p2p/dht/buckets", get(p2p_dht_buckets_handler))
         .route("/p2p/bootstrap", post(p2p_bootstrap_handler))
         .route("/p2p/peer/register", post(p2p_register_peer_handler))
         .route("/p2p/message", post(p2p_message_handler))
@@ -858,6 +868,49 @@ async fn p2p_nearest_peers_handler(
                 "target_peer_id": target_peer_id,
                 "limit": limit,
                 "peers": peers
+            })),
+        ),
+        Err((status, body)) => (status, Json(body)),
+    }
+}
+
+/// P2P DHT 桶视图查询接口。
+async fn p2p_dht_buckets_handler(
+    State(state): State<AppState>,
+    Query(query): Query<P2pDhtBucketsQuery>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let target_peer_id = query.target_peer_id.trim();
+    if target_peer_id.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "ok": false,
+                "error": "target_peer_id 不能为空"
+            })),
+        );
+    }
+
+    let bucket_count = query.bucket_count.unwrap_or(16);
+    if bucket_count == 0 || bucket_count > 64 {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "ok": false,
+                "error": "bucket_count 必须在 1~64 之间"
+            })),
+        );
+    }
+
+    match with_p2p(&state, |engine| {
+        engine.dht_buckets(target_peer_id, bucket_count)
+    }) {
+        Ok(buckets) => (
+            StatusCode::OK,
+            Json(json!({
+                "ok": true,
+                "target_peer_id": target_peer_id,
+                "bucket_count": bucket_count,
+                "buckets": buckets
             })),
         ),
         Err((status, body)) => (status, Json(body)),
@@ -4355,6 +4408,40 @@ mod tests {
         assert_eq!(body["ok"], json!(true));
         let peers = body["peers"].as_array().expect("peers 应为数组");
         assert_eq!(peers.len(), 2);
+    }
+
+    /// 验证 P2P DHT 桶视图查询接口可用。
+    #[tokio::test]
+    async fn p2p_dht_buckets_should_work() {
+        let app = build_test_app();
+        for (peer_id, address) in [
+            ("peer-a", "/ip4/127.0.0.1/tcp/7001"),
+            ("peer-b", "/ip4/127.0.0.1/tcp/7002"),
+            ("peer-c", "/ip4/127.0.0.1/tcp/7003"),
+        ] {
+            let (status, _) = send_json(
+                &app,
+                Method::POST,
+                "/p2p/peer/register",
+                json!({
+                    "peer_id": peer_id,
+                    "address": address
+                }),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK);
+        }
+
+        let (status, body) = send_empty(
+            &app,
+            Method::GET,
+            "/p2p/dht/buckets?target_peer_id=target-2&bucket_count=8",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["ok"], json!(true));
+        let buckets = body["buckets"].as_array().expect("buckets 应为数组");
+        assert!(!buckets.is_empty());
     }
 
     /// 验证 P2P 启动引导会仅返回待握手节点。

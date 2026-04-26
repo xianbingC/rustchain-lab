@@ -1,6 +1,7 @@
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
+    collections::BTreeMap,
     collections::HashMap,
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -42,6 +43,15 @@ pub struct PeerDistance {
     pub peer: PeerInfo,
     /// 目标 ID 与节点 ID 的异或距离（十六进制）。
     pub xor_distance_hex: String,
+}
+
+/// DHT 桶视图项。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DhtBucket {
+    /// 桶索引（数值越大表示距离越近）。
+    pub bucket_index: u8,
+    /// 当前桶包含的节点 ID 列表。
+    pub peer_ids: Vec<String>,
 }
 
 impl PeerInfo {
@@ -166,6 +176,41 @@ impl PeerRegistry {
             .collect()
     }
 
+    /// 按目标节点 ID 生成 DHT 桶视图（基于 XOR 距离前缀）。
+    pub fn dht_buckets(&self, target_id: &str, bucket_count: u8) -> Vec<DhtBucket> {
+        if target_id.trim().is_empty() || bucket_count == 0 {
+            return Vec::new();
+        }
+
+        let target_digest = digest_node_id(target_id);
+        let mut grouped = BTreeMap::<u8, Vec<String>>::new();
+
+        for peer in self.peers.values() {
+            let distance = xor_distance_bytes(&target_digest, &digest_node_id(&peer.id));
+            let leading_zero_bits = leading_zero_bits(&distance);
+            // 将 0..=256 的前导零位映射到桶索引，桶索引越大表示越接近目标。
+            let bucket_index = leading_zero_bits.min(bucket_count as usize - 1) as u8;
+            grouped
+                .entry(bucket_index)
+                .or_default()
+                .push(peer.id.clone());
+        }
+
+        let mut buckets = grouped
+            .into_iter()
+            .map(|(bucket_index, mut peer_ids)| {
+                peer_ids.sort();
+                DhtBucket {
+                    bucket_index,
+                    peer_ids,
+                }
+            })
+            .collect::<Vec<_>>();
+        // 输出按距离从近到远排序，便于运维排查。
+        buckets.sort_by(|left, right| right.bucket_index.cmp(&left.bucket_index));
+        buckets
+    }
+
     /// 标记节点断开。
     pub fn mark_disconnected(&mut self, id: &str) {
         if let Some(peer) = self.peers.get_mut(id) {
@@ -198,6 +243,20 @@ fn xor_distance_bytes(left: &[u8; 32], right: &[u8; 32]) -> [u8; 32] {
         *slot = left[index] ^ right[index];
     }
     out
+}
+
+/// 计算 256 位字节数组的前导零位数。
+fn leading_zero_bits(raw: &[u8; 32]) -> usize {
+    let mut count = 0usize;
+    for byte in raw {
+        if *byte == 0 {
+            count += 8;
+        } else {
+            count += byte.leading_zeros() as usize;
+            break;
+        }
+    }
+    count
 }
 
 #[cfg(test)]
@@ -266,5 +325,20 @@ mod tests {
 
         assert!(registry.nearest_peers("", 5).is_empty());
         assert!(registry.nearest_peers("target-node", 0).is_empty());
+    }
+
+    /// 验证 DHT 桶视图会按桶索引从近到远排序。
+    #[test]
+    fn dht_buckets_should_sort_by_bucket_index_desc() {
+        let mut registry = PeerRegistry::new();
+        registry.upsert("node-a", "/ip4/127.0.0.1/tcp/7001");
+        registry.upsert("node-b", "/ip4/127.0.0.1/tcp/7002");
+        registry.upsert("node-c", "/ip4/127.0.0.1/tcp/7003");
+
+        let buckets = registry.dht_buckets("target-node", 8);
+        assert!(!buckets.is_empty());
+        for pair in buckets.windows(2) {
+            assert!(pair[0].bucket_index >= pair[1].bucket_index);
+        }
     }
 }

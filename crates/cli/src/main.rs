@@ -550,7 +550,7 @@ fn handle_chain_command(config: &AppConfig, args: &[String]) -> AppResult<()> {
 fn handle_p2p_command(config: &AppConfig, args: &[String]) -> AppResult<()> {
     if args.len() < 2 {
         return Err(AppError::Command(
-            "p2p 命令缺少子命令，可用: status/peers/nearest-peers/bootstrap/register-peer/ping/get-chain-status/chain-status/get-blocks/get-mempool"
+            "p2p 命令缺少子命令，可用: status/peers/nearest-peers/dht-buckets/bootstrap/register-peer/ping/get-chain-status/chain-status/get-blocks/get-mempool"
                 .to_string(),
         ));
     }
@@ -581,6 +581,29 @@ fn handle_p2p_command(config: &AppConfig, args: &[String]) -> AppResult<()> {
             let path = format!("/p2p/peers/nearest?target_peer_id={target_peer_id}&limit={limit}");
             let response = call_api_json(config, Method::GET, &path, None)?;
             print_json("p2p_nearest_peers", response)
+        }
+        "dht-buckets" => {
+            let target_peer_id = require_arg(args, 2, "target_peer_id")?;
+            let bucket_count = args
+                .get(3)
+                .map(|raw| {
+                    raw.parse::<u8>().map_err(|error| {
+                        AppError::Command(format!("bucket_count 参数解析失败: {error}"))
+                    })
+                })
+                .transpose()?
+                .unwrap_or(16);
+            if bucket_count == 0 || bucket_count > 64 {
+                return Err(AppError::Command(
+                    "bucket_count 必须在 1~64 之间".to_string(),
+                ));
+            }
+
+            let path = format!(
+                "/p2p/dht/buckets?target_peer_id={target_peer_id}&bucket_count={bucket_count}"
+            );
+            let response = call_api_json(config, Method::GET, &path, None)?;
+            print_json("p2p_dht_buckets", response)
         }
         "bootstrap" => {
             let response = call_api_json(config, Method::POST, "/p2p/bootstrap", None)?;
@@ -1331,6 +1354,7 @@ fn print_help() {
     println!("  rustchain-cli p2p status");
     println!("  rustchain-cli p2p peers");
     println!("  rustchain-cli p2p nearest-peers <target_peer_id> [limit]");
+    println!("  rustchain-cli p2p dht-buckets <target_peer_id> [bucket_count]");
     println!("  rustchain-cli p2p bootstrap");
     println!("  rustchain-cli p2p register-peer <peer_id> <address>");
     println!("  rustchain-cli p2p ping <peer_id> <address> <sequence> [nonce]");
