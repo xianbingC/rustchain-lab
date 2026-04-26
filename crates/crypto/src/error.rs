@@ -21,6 +21,15 @@ pub enum CryptoError {
     /// 钱包解密失败，可能是密码错误或数据损坏。
     #[error("钱包解密失败")]
     WalletDecryptFailed,
+    /// 钱包序列化或反序列化失败。
+    #[error("钱包序列化失败: {0}")]
+    WalletSerde(String),
+    /// 钱包文件读写失败。
+    #[error("钱包文件读写失败: {0}")]
+    WalletIo(String),
+    /// 钱包数据结构不合法。
+    #[error("钱包数据不合法: {0}")]
+    InvalidWallet(String),
 }
 
 /// 加密模块统一返回类型。

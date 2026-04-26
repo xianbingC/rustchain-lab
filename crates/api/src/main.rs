@@ -10,7 +10,9 @@ use rustchain_common::{logging::init_logging, AppConfig, AppResult};
 use rustchain_core::block::Block;
 use rustchain_core::blockchain::Blockchain;
 use rustchain_core::transaction::Transaction;
-use rustchain_crypto::wallet::create_wallet;
+use rustchain_crypto::wallet::{
+    create_wallet, create_wallet_from_private_key, import_wallet_from_json,
+};
 use rustchain_p2p::{
     engine::{OutboundEnvelope, SyncEngine},
     message::{ChainStatus, NetworkMessage},
@@ -214,6 +216,22 @@ struct CreateWalletRequest {
     password: String,
 }
 
+/// 私钥导入请求。
+#[derive(Debug, Deserialize)]
+struct ImportPrivateWalletRequest {
+    /// 私钥（十六进制）。
+    private_key: String,
+    /// 钱包密码。
+    password: String,
+}
+
+/// 钱包恢复请求。
+#[derive(Debug, Deserialize)]
+struct RestoreWalletRequest {
+    /// 钱包备份 JSON。
+    wallet_json: String,
+}
+
 /// 交易验签请求。
 #[derive(Debug, Deserialize)]
 struct VerifyTxRequest {
@@ -409,6 +427,96 @@ async fn wallet_create_handler(
     }
 }
 
+/// 钱包私钥导入接口。
+async fn wallet_import_private_handler(
+    Json(payload): Json<ImportPrivateWalletRequest>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    if payload.private_key.trim().is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "ok": false,
+                "error": "private_key 不能为空"
+            })),
+        );
+    }
+    if payload.password.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "ok": false,
+                "error": "password 不能为空"
+            })),
+        );
+    }
+
+    match create_wallet_from_private_key(&payload.private_key, &payload.password) {
+        Ok((wallet, key_pair)) => (
+            StatusCode::OK,
+            Json(json!({
+                "ok": true,
+                "wallet": {
+                    "address": wallet.address,
+                    "public_key": wallet.public_key,
+                    "encrypted_private_key": wallet.encrypted_private_key,
+                    "kdf_salt": wallet.kdf_salt,
+                    "private_key_checksum": wallet.private_key_checksum
+                },
+                "key_pair": {
+                    "address": key_pair.address,
+                    "public_key": key_pair.public_key,
+                    "private_key": key_pair.private_key
+                }
+            })),
+        ),
+        Err(error) => (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "ok": false,
+                "error": error.to_string()
+            })),
+        ),
+    }
+}
+
+/// 钱包恢复接口：校验备份 JSON 并返回钱包内容。
+async fn wallet_restore_handler(
+    Json(payload): Json<RestoreWalletRequest>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    if payload.wallet_json.trim().is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "ok": false,
+                "error": "wallet_json 不能为空"
+            })),
+        );
+    }
+
+    match import_wallet_from_json(&payload.wallet_json) {
+        Ok(wallet) => (
+            StatusCode::OK,
+            Json(json!({
+                "ok": true,
+                "wallet": {
+                    "address": wallet.address,
+                    "public_key": wallet.public_key,
+                    "encrypted_private_key": wallet.encrypted_private_key,
+                    "kdf_salt": wallet.kdf_salt,
+                    "private_key_checksum": wallet.private_key_checksum
+                }
+            })),
+        ),
+        Err(error) => (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "ok": false,
+                "error": error.to_string()
+            })),
+        ),
+    }
+}
+
 /// API 进程内共享状态。
 #[derive(Clone)]
 struct AppState {
@@ -524,6 +632,11 @@ fn build_app(shared_state: AppState) -> Router {
         .route("/health/ready", get(health_ready_handler))
         .route("/metrics", get(metrics_handler))
         .route("/wallet/create", post(wallet_create_handler))
+        .route(
+            "/wallet/import-private",
+            post(wallet_import_private_handler),
+        )
+        .route("/wallet/restore", post(wallet_restore_handler))
         .route("/tx/verify", post(tx_verify_handler))
         .route("/p2p/status", get(p2p_status_handler))
         .route("/p2p/peers", get(p2p_peers_handler))
@@ -2988,6 +3101,59 @@ mod tests {
         assert_eq!(body["probe"], json!("ready"));
         assert_eq!(body["chain_height"], json!(0));
         assert_eq!(body["pending_tx_count"], json!(0));
+    }
+
+    /// 验证钱包私钥导入和恢复接口可用。
+    #[tokio::test]
+    async fn wallet_import_private_and_restore_should_work() {
+        let app = build_test_app();
+        let (_, key_pair) = create_wallet("source-pass").expect("创建钱包应成功");
+
+        let (status, body) = send_json(
+            &app,
+            Method::POST,
+            "/wallet/import-private",
+            json!({
+                "private_key": key_pair.private_key,
+                "password": "import-pass"
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["ok"], json!(true));
+        assert_eq!(body["wallet"]["address"], json!(key_pair.address));
+
+        let wallet_json = serde_json::to_string(&body["wallet"]).expect("序列化钱包应成功");
+        let (status, body) = send_json(
+            &app,
+            Method::POST,
+            "/wallet/restore",
+            json!({
+                "wallet_json": wallet_json
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["ok"], json!(true));
+        assert_eq!(body["wallet"]["address"], json!(key_pair.address));
+    }
+
+    /// 验证空钱包恢复请求会被拒绝。
+    #[tokio::test]
+    async fn wallet_restore_with_empty_payload_should_fail() {
+        let app = build_test_app();
+        let (status, body) = send_json(
+            &app,
+            Method::POST,
+            "/wallet/restore",
+            json!({
+                "wallet_json": ""
+            }),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["ok"], json!(false));
     }
 
     /// 验证 Prometheus 指标接口可用。

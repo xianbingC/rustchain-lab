@@ -94,6 +94,22 @@ cd /path/to/rustchain-lab
 ./scripts/backup_data.sh restore /path/to/archive.tar.gz
 ```
 
+### Wallet Backup / Restore
+
+```bash
+# 创建钱包并导出备份文件
+cargo run -q -p rustchain-cli -- wallet create my-pass ./wallet-backup.json
+
+# 从备份文件恢复钱包（仅恢复加密钱包数据）
+cargo run -q -p rustchain-cli -- wallet restore ./wallet-backup.json
+
+# 从备份文件 + 密码恢复私钥（开发演示用途）
+cargo run -q -p rustchain-cli -- wallet recover-private ./wallet-backup.json my-pass
+
+# 通过私钥导入钱包并导出备份文件
+cargo run -q -p rustchain-cli -- wallet import-private <private_key_hex> my-pass ./imported-wallet.json
+```
+
 ### Multi-node Smoke Check
 
 ```bash

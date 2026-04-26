@@ -2,7 +2,10 @@ use reqwest::{blocking::Client, Method};
 use rustchain_common::{logging::init_logging, AppConfig, AppError, AppResult};
 use rustchain_core::block::Block;
 use rustchain_core::transaction::{Transaction, TransactionKind};
-use rustchain_crypto::wallet::create_wallet;
+use rustchain_crypto::wallet::{
+    backup_wallet_to_file, create_wallet, create_wallet_from_private_key, restore_wallet_from_file,
+    Wallet, WalletKeyPair,
+};
 use serde_json::{json, Value};
 use std::{
     fs,
@@ -64,7 +67,7 @@ fn dispatch_command(config: &AppConfig, args: &[String]) -> AppResult<()> {
 fn handle_wallet_command(args: &[String]) -> AppResult<()> {
     if args.len() < 2 {
         return Err(AppError::Command(
-            "wallet 命令缺少子命令，可用: wallet create <password>".to_string(),
+            "wallet 命令缺少子命令，可用: wallet create <password> [backup_path] / wallet restore <backup_path> / wallet recover-private <backup_path> <password> / wallet import-private <private_key_hex> <password> [backup_path]".to_string(),
         ));
     }
 
@@ -76,29 +79,115 @@ fn handle_wallet_command(args: &[String]) -> AppResult<()> {
             let password = &args[2];
             let (wallet, key_pair) = create_wallet(password)
                 .map_err(|error| AppError::Command(format!("创建钱包失败: {error}")))?;
+            if let Some(path) = args.get(3) {
+                backup_wallet_to_file(&wallet, path)
+                    .map_err(|error| AppError::Command(format!("备份钱包失败: {error}")))?;
+                print_json(
+                    "wallet_backup",
+                    json!({
+                        "saved": true,
+                        "path": path
+                    }),
+                )?;
+            }
 
-            print_json(
-                "wallet",
-                json!({
-                    "address": wallet.address,
-                    "public_key": wallet.public_key,
-                    "encrypted_private_key": wallet.encrypted_private_key,
-                    "kdf_salt": wallet.kdf_salt,
-                }),
-            )?;
-
+            print_wallet(&wallet)?;
             // 原型阶段用于学习和调试，演示时直接输出私钥。
+            print_wallet_key_pair(&key_pair)
+        }
+        "restore" => {
+            if args.len() < 3 {
+                return Err(AppError::Command(
+                    "wallet restore 需要备份文件路径".to_string(),
+                ));
+            }
+            let wallet = restore_wallet_from_file(&args[2])
+                .map_err(|error| AppError::Command(format!("恢复钱包失败: {error}")))?;
             print_json(
-                "wallet_key_pair",
+                "wallet_restore",
                 json!({
-                    "address": key_pair.address,
-                    "public_key": key_pair.public_key,
-                    "private_key": key_pair.private_key,
+                    "source": args[2],
+                    "wallet": {
+                        "address": wallet.address,
+                        "public_key": wallet.public_key,
+                        "encrypted_private_key": wallet.encrypted_private_key,
+                        "kdf_salt": wallet.kdf_salt,
+                        "private_key_checksum": wallet.private_key_checksum
+                    }
                 }),
             )
         }
+        "recover-private" => {
+            if args.len() < 4 {
+                return Err(AppError::Command(
+                    "wallet recover-private 需要备份文件路径和密码".to_string(),
+                ));
+            }
+            let wallet = restore_wallet_from_file(&args[2])
+                .map_err(|error| AppError::Command(format!("读取钱包备份失败: {error}")))?;
+            let private_key = wallet
+                .decrypt_private_key(&args[3])
+                .map_err(|error| AppError::Command(format!("恢复私钥失败: {error}")))?;
+            print_json(
+                "wallet_recover_private",
+                json!({
+                    "source": args[2],
+                    "address": wallet.address,
+                    "private_key": private_key
+                }),
+            )
+        }
+        "import-private" => {
+            if args.len() < 4 {
+                return Err(AppError::Command(
+                    "wallet import-private 需要 private_key_hex 和 password 参数".to_string(),
+                ));
+            }
+            let (wallet, key_pair) = create_wallet_from_private_key(&args[2], &args[3])
+                .map_err(|error| AppError::Command(format!("导入私钥失败: {error}")))?;
+            if let Some(path) = args.get(4) {
+                backup_wallet_to_file(&wallet, path)
+                    .map_err(|error| AppError::Command(format!("备份钱包失败: {error}")))?;
+                print_json(
+                    "wallet_backup",
+                    json!({
+                        "saved": true,
+                        "path": path
+                    }),
+                )?;
+            }
+
+            print_wallet(&wallet)?;
+            print_wallet_key_pair(&key_pair)
+        }
         other => Err(AppError::Command(format!("未知 wallet 子命令: {other}"))),
     }
+}
+
+/// 输出钱包公开信息。
+fn print_wallet(wallet: &Wallet) -> AppResult<()> {
+    print_json(
+        "wallet",
+        json!({
+            "address": wallet.address,
+            "public_key": wallet.public_key,
+            "encrypted_private_key": wallet.encrypted_private_key,
+            "kdf_salt": wallet.kdf_salt,
+            "private_key_checksum": wallet.private_key_checksum
+        }),
+    )
+}
+
+/// 输出钱包密钥对（仅用于开发调试）。
+fn print_wallet_key_pair(key_pair: &WalletKeyPair) -> AppResult<()> {
+    print_json(
+        "wallet_key_pair",
+        json!({
+            "address": key_pair.address,
+            "public_key": key_pair.public_key,
+            "private_key": key_pair.private_key,
+        }),
+    )
 }
 
 /// 处理交易相关命令。
@@ -1185,7 +1274,10 @@ fn read_contract_source(path: &str) -> AppResult<String> {
 fn print_help() {
     println!("RustChain Lab CLI");
     println!("用法:");
-    println!("  rustchain-cli wallet create <password>");
+    println!("  rustchain-cli wallet create <password> [backup_path]");
+    println!("  rustchain-cli wallet restore <backup_path>");
+    println!("  rustchain-cli wallet recover-private <backup_path> <password>");
+    println!("  rustchain-cli wallet import-private <private_key_hex> <password> [backup_path]");
     println!("  rustchain-cli tx sign-demo [amount]");
     println!("  rustchain-cli health [live|ready|metrics]");
     println!("  rustchain-cli chain info");
