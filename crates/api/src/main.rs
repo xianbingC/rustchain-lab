@@ -4444,6 +4444,54 @@ mod tests {
         assert!(!buckets.is_empty());
     }
 
+    /// 验证 P2P find_node 会返回 nodes 结果。
+    #[tokio::test]
+    async fn p2p_find_node_should_return_nodes() {
+        let app = build_test_app();
+        for (peer_id, address) in [
+            ("peer-a", "/ip4/127.0.0.1/tcp/7001"),
+            ("peer-b", "/ip4/127.0.0.1/tcp/7002"),
+            ("peer-c", "/ip4/127.0.0.1/tcp/7003"),
+        ] {
+            let (status, _) = send_json(
+                &app,
+                Method::POST,
+                "/p2p/peer/register",
+                json!({
+                    "peer_id": peer_id,
+                    "address": address
+                }),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK);
+        }
+
+        let (status, body) = send_json(
+            &app,
+            Method::POST,
+            "/p2p/message",
+            json!({
+                "peer_id": "peer-a",
+                "address": "/ip4/127.0.0.1/tcp/7001",
+                "sequence": 1,
+                "message": {
+                    "FindNode": {
+                        "target_id": "target-3",
+                        "limit": 2
+                    }
+                }
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["ok"], json!(true));
+        assert_eq!(body["outbound_count"], json!(1));
+        let peers = body["outbound"][0]["message"]["Nodes"]["peers"]
+            .as_array()
+            .expect("nodes.peers 应为数组");
+        assert_eq!(peers.len(), 2);
+    }
+
     /// 验证 P2P 启动引导会仅返回待握手节点。
     #[tokio::test]
     async fn p2p_bootstrap_should_only_include_unconnected_peers() {

@@ -31,6 +31,15 @@ pub struct ChainStatus {
     pub genesis_hash: String,
 }
 
+/// 节点发现结果中的节点条目。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DiscoveredPeer {
+    /// 节点 ID。
+    pub peer_id: String,
+    /// 节点网络地址。
+    pub address: String,
+}
+
 /// 网络消息结构，覆盖握手、状态同步、交易和区块广播。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum NetworkMessage {
@@ -56,6 +65,10 @@ pub enum NetworkMessage {
     GetChainStatus,
     /// 返回链状态。
     ChainStatus(ChainStatus),
+    /// 查询与目标 ID 最近的节点。
+    FindNode { target_id: String, limit: u8 },
+    /// 返回节点发现结果。
+    Nodes { peers: Vec<DiscoveredPeer> },
 }
 
 /// 消息基础校验错误。
@@ -87,6 +100,8 @@ impl NetworkMessage {
             Self::Mempool { .. } => "mempool",
             Self::GetChainStatus => "get_chain_status",
             Self::ChainStatus(_) => "chain_status",
+            Self::FindNode { .. } => "find_node",
+            Self::Nodes { .. } => "nodes",
         }
     }
 
@@ -128,6 +143,24 @@ impl NetworkMessage {
                 Ok(())
             }
             Self::ChainStatus(status) => status.validate_basic(),
+            Self::FindNode { target_id, limit } => {
+                if target_id.trim().is_empty() {
+                    return Err(MessageValidationError::MissingField("target_id"));
+                }
+                if *limit == 0 || *limit > 64 {
+                    return Err(MessageValidationError::InvalidField("limit"));
+                }
+                Ok(())
+            }
+            Self::Nodes { peers } => {
+                if peers.iter().any(|peer| peer.peer_id.trim().is_empty()) {
+                    return Err(MessageValidationError::MissingField("peer_id"));
+                }
+                if peers.iter().any(|peer| peer.address.trim().is_empty()) {
+                    return Err(MessageValidationError::MissingField("address"));
+                }
+                Ok(())
+            }
         }
     }
 }
@@ -228,5 +261,43 @@ mod tests {
 
         assert!(msg.validate_basic().is_ok());
         assert_eq!(msg.message_type(), "chain_status");
+    }
+
+    /// 验证 find_node 消息会校验目标 ID 和 limit。
+    #[test]
+    fn find_node_should_validate_target_and_limit() {
+        let missing_target = NetworkMessage::FindNode {
+            target_id: String::new(),
+            limit: 8,
+        };
+        assert_eq!(
+            missing_target.validate_basic(),
+            Err(MessageValidationError::MissingField("target_id"))
+        );
+
+        let invalid_limit = NetworkMessage::FindNode {
+            target_id: "target-1".to_string(),
+            limit: 0,
+        };
+        assert_eq!(
+            invalid_limit.validate_basic(),
+            Err(MessageValidationError::InvalidField("limit"))
+        );
+    }
+
+    /// 验证 nodes 消息会校验节点结果字段。
+    #[test]
+    fn nodes_should_validate_peer_entries() {
+        let invalid = NetworkMessage::Nodes {
+            peers: vec![DiscoveredPeer {
+                peer_id: String::new(),
+                address: "/ip4/127.0.0.1/tcp/7001".to_string(),
+            }],
+        };
+
+        assert_eq!(
+            invalid.validate_basic(),
+            Err(MessageValidationError::MissingField("peer_id"))
+        );
     }
 }

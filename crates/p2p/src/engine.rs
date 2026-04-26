@@ -1,7 +1,7 @@
 use crate::{
     codec::MessageCodec,
     error::{P2pError, P2pResult},
-    message::{ChainStatus, Handshake, NetworkMessage},
+    message::{ChainStatus, DiscoveredPeer, Handshake, NetworkMessage},
     peer::{DhtBucket, PeerDistance, PeerRegistry, PeerStatus},
     queue::{OrderedMessageQueue, SequencedMessage},
 };
@@ -282,6 +282,21 @@ impl SyncEngine {
                     });
                 }
             }
+            NetworkMessage::FindNode { target_id, limit } => {
+                let peers = self
+                    .peers
+                    .nearest_peers(&target_id, limit as usize)
+                    .into_iter()
+                    .map(|item| DiscoveredPeer {
+                        peer_id: item.peer.id,
+                        address: item.peer.address,
+                    })
+                    .collect::<Vec<_>>();
+                outbound.push(OutboundEnvelope {
+                    target_peer_id: peer_id.to_string(),
+                    message: NetworkMessage::Nodes { peers },
+                });
+            }
             NetworkMessage::GetMempool => {
                 outbound.push(OutboundEnvelope {
                     target_peer_id: peer_id.to_string(),
@@ -301,7 +316,8 @@ impl SyncEngine {
             | NetworkMessage::NewTransaction { .. }
             | NetworkMessage::NewBlock { .. }
             | NetworkMessage::Blocks { .. }
-            | NetworkMessage::Mempool { .. } => {}
+            | NetworkMessage::Mempool { .. }
+            | NetworkMessage::Nodes { .. } => {}
         }
 
         Ok(outbound)
@@ -487,6 +503,33 @@ mod tests {
         assert!(!buckets.is_empty());
         for pair in buckets.windows(2) {
             assert!(pair[0].bucket_index >= pair[1].bucket_index);
+        }
+    }
+
+    /// 验证 find_node 请求会返回 nodes 响应。
+    #[test]
+    fn find_node_should_reply_nodes() {
+        let mut engine = SyncEngine::new("local-node", local_status(2));
+        engine.register_peer("peer-a", "/ip4/127.0.0.1/tcp/7001");
+        engine.register_peer("peer-b", "/ip4/127.0.0.1/tcp/7002");
+        engine.register_peer("peer-c", "/ip4/127.0.0.1/tcp/7003");
+
+        let report = engine
+            .on_incoming_message(
+                "peer-a",
+                "/ip4/127.0.0.1/tcp/7001",
+                1,
+                NetworkMessage::FindNode {
+                    target_id: "target-1".to_string(),
+                    limit: 2,
+                },
+            )
+            .expect("处理 find_node 应成功");
+
+        assert_eq!(report.outbound.len(), 1);
+        match &report.outbound[0].message {
+            NetworkMessage::Nodes { peers } => assert_eq!(peers.len(), 2),
+            _ => panic!("应返回 nodes 响应"),
         }
     }
 }
