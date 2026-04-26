@@ -42,6 +42,8 @@ use tokio::net::TcpListener;
 const CONTRACT_SNAPSHOT_FIELD: &str = "__snapshot__";
 /// 合约事件快照字段名。
 const CONTRACT_EVENTS_FIELD: &str = "__events__";
+/// P2P 协议版本号（原型阶段固定）。
+const P2P_PROTOCOL_VERSION: &str = "1.0.0";
 
 /// API 程序入口。
 #[tokio::main]
@@ -533,6 +535,10 @@ struct AppState {
     blockchain: Arc<Mutex<Blockchain>>,
     /// P2P 同步引擎。
     p2p_engine: Arc<Mutex<SyncEngine>>,
+    /// 本地 P2P 监听地址，用于构造握手消息。
+    p2p_listen_addr: String,
+    /// 本地 P2P 协议版本，用于构造握手消息。
+    p2p_protocol_version: String,
     /// 状态存储（余额与合约状态）。
     state_store: Arc<dyn StateStore + Send + Sync>,
     /// 历史数据存储。
@@ -551,6 +557,8 @@ fn default_app_state() -> AppState {
     AppState {
         blockchain: Arc::new(Mutex::new(blockchain)),
         p2p_engine: Arc::new(Mutex::new(SyncEngine::new("api-test-node", chain_status))),
+        p2p_listen_addr: "0.0.0.0:7000".to_string(),
+        p2p_protocol_version: P2P_PROTOCOL_VERSION.to_string(),
         state_store: Arc::new(InMemoryStateStore::new()),
         history_store: Arc::new(rustchain_storage::history::InMemoryHistoryStore::new()),
         lending_pool: Arc::new(Mutex::new(LendingPool::new(
@@ -579,6 +587,8 @@ fn default_app_state_with_config(config: &AppConfig) -> AppResult<AppState> {
     Ok(AppState {
         blockchain: Arc::new(Mutex::new(blockchain)),
         p2p_engine: Arc::new(Mutex::new(p2p_engine)),
+        p2p_listen_addr: config.p2p_bind_addr.clone(),
+        p2p_protocol_version: P2P_PROTOCOL_VERSION.to_string(),
         state_store,
         history_store,
         lending_pool: Arc::new(Mutex::new(LendingPool::new(
@@ -699,6 +709,7 @@ fn build_app(shared_state: AppState) -> Router {
         .route("/p2p/status", get(p2p_status_handler))
         .route("/p2p/peers", get(p2p_peers_handler))
         .route("/p2p/peers/nearest", get(p2p_nearest_peers_handler))
+        .route("/p2p/bootstrap", post(p2p_bootstrap_handler))
         .route("/p2p/peer/register", post(p2p_register_peer_handler))
         .route("/p2p/message", post(p2p_message_handler))
         .route("/chain/info", get(chain_info_handler))
@@ -847,6 +858,29 @@ async fn p2p_nearest_peers_handler(
                 "target_peer_id": target_peer_id,
                 "limit": limit,
                 "peers": peers
+            })),
+        ),
+        Err((status, body)) => (status, Json(body)),
+    }
+}
+
+/// P2P 启动引导接口：为当前未连接节点构建握手消息列表。
+async fn p2p_bootstrap_handler(
+    State(state): State<AppState>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let listen_addr = state.p2p_listen_addr.clone();
+    let protocol_version = state.p2p_protocol_version.clone();
+    match with_p2p(&state, |engine| {
+        engine.build_bootstrap_handshakes(&listen_addr, &protocol_version)
+    }) {
+        Ok(outbound) => (
+            StatusCode::OK,
+            Json(json!({
+                "ok": true,
+                "listen_addr": listen_addr,
+                "protocol_version": protocol_version,
+                "outbound_count": outbound.len(),
+                "outbound": outbound
             })),
         ),
         Err((status, body)) => (status, Json(body)),
@@ -4321,6 +4355,53 @@ mod tests {
         assert_eq!(body["ok"], json!(true));
         let peers = body["peers"].as_array().expect("peers 应为数组");
         assert_eq!(peers.len(), 2);
+    }
+
+    /// 验证 P2P 启动引导会仅返回待握手节点。
+    #[tokio::test]
+    async fn p2p_bootstrap_should_only_include_unconnected_peers() {
+        let app = build_test_app();
+        for (peer_id, address) in [
+            ("peer-a", "/ip4/127.0.0.1/tcp/7001"),
+            ("peer-b", "/ip4/127.0.0.1/tcp/7002"),
+        ] {
+            let (status, _) = send_json(
+                &app,
+                Method::POST,
+                "/p2p/peer/register",
+                json!({
+                    "peer_id": peer_id,
+                    "address": address
+                }),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK);
+        }
+
+        // 通过一次消息交互将 peer-a 标记为已连接。
+        let (status, _) = send_json(
+            &app,
+            Method::POST,
+            "/p2p/message",
+            json!({
+                "peer_id": "peer-a",
+                "address": "/ip4/127.0.0.1/tcp/7001",
+                "sequence": 1,
+                "message": "GetChainStatus"
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+
+        let (status, body) = send_json(&app, Method::POST, "/p2p/bootstrap", json!({})).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["ok"], json!(true));
+        assert_eq!(body["outbound_count"], json!(1));
+        assert_eq!(body["outbound"][0]["target_peer_id"], json!("peer-b"));
+        assert_eq!(
+            body["outbound"][0]["message"]["Handshake"]["protocol_version"],
+            json!("1.0.0")
+        );
     }
 
     /// 验证链交易提交与挖矿会触发 P2P 广播。

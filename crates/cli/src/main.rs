@@ -550,7 +550,7 @@ fn handle_chain_command(config: &AppConfig, args: &[String]) -> AppResult<()> {
 fn handle_p2p_command(config: &AppConfig, args: &[String]) -> AppResult<()> {
     if args.len() < 2 {
         return Err(AppError::Command(
-            "p2p 命令缺少子命令，可用: status/peers/nearest-peers/register-peer/ping/get-chain-status/chain-status/get-blocks/get-mempool"
+            "p2p 命令缺少子命令，可用: status/peers/nearest-peers/bootstrap/register-peer/ping/get-chain-status/chain-status/get-blocks/get-mempool"
                 .to_string(),
         ));
     }
@@ -581,6 +581,10 @@ fn handle_p2p_command(config: &AppConfig, args: &[String]) -> AppResult<()> {
             let path = format!("/p2p/peers/nearest?target_peer_id={target_peer_id}&limit={limit}");
             let response = call_api_json(config, Method::GET, &path, None)?;
             print_json("p2p_nearest_peers", response)
+        }
+        "bootstrap" => {
+            let response = call_api_json(config, Method::POST, "/p2p/bootstrap", None)?;
+            print_json("p2p_bootstrap", response)
         }
         "register-peer" => {
             let peer_id = require_arg(args, 2, "peer_id")?;
@@ -1327,6 +1331,7 @@ fn print_help() {
     println!("  rustchain-cli p2p status");
     println!("  rustchain-cli p2p peers");
     println!("  rustchain-cli p2p nearest-peers <target_peer_id> [limit]");
+    println!("  rustchain-cli p2p bootstrap");
     println!("  rustchain-cli p2p register-peer <peer_id> <address>");
     println!("  rustchain-cli p2p ping <peer_id> <address> <sequence> [nonce]");
     println!("  rustchain-cli p2p get-chain-status <peer_id> <address> <sequence>");

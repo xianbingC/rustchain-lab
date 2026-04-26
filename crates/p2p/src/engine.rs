@@ -1,8 +1,8 @@
 use crate::{
     codec::MessageCodec,
     error::{P2pError, P2pResult},
-    message::{ChainStatus, NetworkMessage},
-    peer::{PeerDistance, PeerRegistry},
+    message::{ChainStatus, Handshake, NetworkMessage},
+    peer::{PeerDistance, PeerRegistry, PeerStatus},
     queue::{OrderedMessageQueue, SequencedMessage},
 };
 use serde::{Deserialize, Serialize};
@@ -150,6 +150,43 @@ impl SyncEngine {
         }
 
         Ok(self.peers.nearest_peers(target_peer_id, limit))
+    }
+
+    /// 为未连接节点构建启动握手消息列表，交由传输层逐个发送。
+    pub fn build_bootstrap_handshakes(
+        &self,
+        listen_addr: &str,
+        protocol_version: &str,
+    ) -> P2pResult<Vec<OutboundEnvelope>> {
+        if listen_addr.trim().is_empty() {
+            return Err(P2pError::InvalidArgument(
+                "listen_addr 不能为空".to_string(),
+            ));
+        }
+        if protocol_version.trim().is_empty() {
+            return Err(P2pError::InvalidArgument(
+                "protocol_version 不能为空".to_string(),
+            ));
+        }
+
+        let mut outbound = self
+            .peers
+            .snapshot()
+            .into_iter()
+            .filter(|peer| peer.id != self.local_peer_id && peer.status != PeerStatus::Connected)
+            .map(|peer| OutboundEnvelope {
+                target_peer_id: peer.id,
+                message: NetworkMessage::Handshake(Handshake {
+                    node_id: self.local_peer_id.clone(),
+                    protocol_version: protocol_version.to_string(),
+                    listen_addr: listen_addr.to_string(),
+                    best_height: self.local_chain_status.best_height,
+                    best_hash: self.local_chain_status.best_hash.clone(),
+                }),
+            })
+            .collect::<Vec<_>>();
+        outbound.sort_by(|left, right| left.target_peer_id.cmp(&right.target_peer_id));
+        Ok(outbound)
     }
 
     /// 获取某节点的下一期望序号。
@@ -394,5 +431,29 @@ mod tests {
             .expect("最近邻查询应成功");
         assert_eq!(nearest.len(), 2);
         assert!(nearest[0].xor_distance_hex <= nearest[1].xor_distance_hex);
+    }
+
+    /// 验证启动握手仅会发往未连接节点。
+    #[test]
+    fn build_bootstrap_handshakes_should_skip_connected_peers() {
+        let mut engine = SyncEngine::new("local-node", local_status(3));
+        engine.register_peer("peer-a", "/ip4/127.0.0.1/tcp/7001");
+        engine.register_peer("peer-b", "/ip4/127.0.0.1/tcp/7002");
+
+        let _ = engine
+            .on_incoming_message(
+                "peer-a",
+                "/ip4/127.0.0.1/tcp/7001",
+                1,
+                NetworkMessage::GetChainStatus,
+            )
+            .expect("处理应当成功");
+
+        let outbound = engine
+            .build_bootstrap_handshakes("0.0.0.0:7000", "1.0.0")
+            .expect("构建握手应成功");
+        assert_eq!(outbound.len(), 1);
+        assert_eq!(outbound[0].target_peer_id, "peer-b");
+        assert!(matches!(outbound[0].message, NetworkMessage::Handshake(_)));
     }
 }
