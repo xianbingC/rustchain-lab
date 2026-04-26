@@ -2,7 +2,7 @@ use crate::{
     codec::MessageCodec,
     error::{P2pError, P2pResult},
     message::{ChainStatus, NetworkMessage},
-    peer::PeerRegistry,
+    peer::{PeerDistance, PeerRegistry},
     queue::{OrderedMessageQueue, SequencedMessage},
 };
 use serde::{Deserialize, Serialize};
@@ -132,6 +132,24 @@ impl SyncEngine {
     /// 返回当前已知节点数。
     pub fn peer_count(&self) -> usize {
         self.peers.len()
+    }
+
+    /// 按目标节点 ID 返回最近邻节点列表。
+    pub fn nearest_peers(
+        &self,
+        target_peer_id: &str,
+        limit: usize,
+    ) -> P2pResult<Vec<PeerDistance>> {
+        if target_peer_id.trim().is_empty() {
+            return Err(P2pError::InvalidArgument(
+                "target_peer_id 不能为空".to_string(),
+            ));
+        }
+        if limit == 0 {
+            return Err(P2pError::InvalidArgument("limit 必须大于 0".to_string()));
+        }
+
+        Ok(self.peers.nearest_peers(target_peer_id, limit))
     }
 
     /// 获取某节点的下一期望序号。
@@ -361,5 +379,20 @@ mod tests {
         let outbound = engine.broadcast_to_connected(NetworkMessage::GetMempool);
         assert_eq!(outbound.len(), 1);
         assert_eq!(outbound[0].target_peer_id, "peer-a");
+    }
+
+    /// 验证同步引擎可返回最近邻节点。
+    #[test]
+    fn nearest_peers_should_work() {
+        let mut engine = SyncEngine::new("local-node", local_status(2));
+        engine.register_peer("peer-a", "/ip4/127.0.0.1/tcp/7001");
+        engine.register_peer("peer-b", "/ip4/127.0.0.1/tcp/7002");
+        engine.register_peer("peer-c", "/ip4/127.0.0.1/tcp/7003");
+
+        let nearest = engine
+            .nearest_peers("target-peer", 2)
+            .expect("最近邻查询应成功");
+        assert_eq!(nearest.len(), 2);
+        assert!(nearest[0].xor_distance_hex <= nearest[1].xor_distance_hex);
     }
 }

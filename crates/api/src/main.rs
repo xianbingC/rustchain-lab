@@ -262,6 +262,15 @@ struct P2pRegisterPeerRequest {
     address: String,
 }
 
+/// P2P 最近邻查询参数。
+#[derive(Debug, Deserialize)]
+struct P2pNearestPeersQuery {
+    /// 目标节点 ID。
+    target_peer_id: String,
+    /// 可选返回条数上限，默认 8。
+    limit: Option<usize>,
+}
+
 /// P2P 入站消息请求。
 #[derive(Debug, Deserialize)]
 struct P2pIncomingMessageRequest {
@@ -559,11 +568,17 @@ fn default_app_state_with_config(config: &AppConfig) -> AppResult<AppState> {
     blockchain.difficulty_adjustment_interval = config.difficulty_adjustment_interval;
     let chain_status = chain_status_from_blockchain(&blockchain);
     let local_peer_id = format!("{}-node", config.app_name);
+    let mut p2p_engine = SyncEngine::new(local_peer_id, chain_status);
+    let seeded_peer_count =
+        bootstrap_seed_nodes(&mut p2p_engine, &mut blockchain, &config.seed_nodes);
+    if seeded_peer_count > 0 {
+        tracing::info!(seeded_peer_count, "已加载种子节点到 P2P 引擎");
+    }
     let state_store = open_state_store(config)?;
     let history_store = open_history_store(config)?;
     Ok(AppState {
         blockchain: Arc::new(Mutex::new(blockchain)),
-        p2p_engine: Arc::new(Mutex::new(SyncEngine::new(local_peer_id, chain_status))),
+        p2p_engine: Arc::new(Mutex::new(p2p_engine)),
         state_store,
         history_store,
         lending_pool: Arc::new(Mutex::new(LendingPool::new(
@@ -624,6 +639,49 @@ fn chain_status_from_blockchain(chain: &Blockchain) -> ChainStatus {
     }
 }
 
+/// 将配置中的种子节点导入同步引擎和链节点列表。
+fn bootstrap_seed_nodes(
+    engine: &mut SyncEngine,
+    chain: &mut Blockchain,
+    seed_nodes: &[String],
+) -> usize {
+    let mut imported = 0usize;
+    for (index, raw) in seed_nodes.iter().enumerate() {
+        let Some((peer_id, address)) = parse_seed_node_entry(raw, index) else {
+            continue;
+        };
+
+        let before_count = engine.peer_count();
+        engine.register_peer(peer_id, address.clone());
+        chain.add_peer(address);
+        if engine.peer_count() > before_count {
+            imported = imported.saturating_add(1);
+        }
+    }
+
+    imported
+}
+
+/// 解析种子节点配置项，支持 `peer_id@address` 与纯地址两种格式。
+fn parse_seed_node_entry(raw: &str, index: usize) -> Option<(String, String)> {
+    let value = raw.trim();
+    if value.is_empty() {
+        return None;
+    }
+
+    if let Some((peer_id, address)) = value.split_once('@') {
+        let peer_id = peer_id.trim();
+        let address = address.trim();
+        if peer_id.is_empty() || address.is_empty() {
+            return None;
+        }
+        return Some((peer_id.to_string(), address.to_string()));
+    }
+
+    // 仅提供地址时自动生成稳定的种子节点 ID，便于后续查询和调试。
+    Some((format!("seed-{}", index + 1), value.to_string()))
+}
+
 /// 构造 API 路由。
 fn build_app(shared_state: AppState) -> Router {
     Router::new()
@@ -640,6 +698,7 @@ fn build_app(shared_state: AppState) -> Router {
         .route("/tx/verify", post(tx_verify_handler))
         .route("/p2p/status", get(p2p_status_handler))
         .route("/p2p/peers", get(p2p_peers_handler))
+        .route("/p2p/peers/nearest", get(p2p_nearest_peers_handler))
         .route("/p2p/peer/register", post(p2p_register_peer_handler))
         .route("/p2p/message", post(p2p_message_handler))
         .route("/chain/info", get(chain_info_handler))
@@ -749,6 +808,47 @@ async fn p2p_peers_handler(State(state): State<AppState>) -> (StatusCode, Json<s
         }))
     }) {
         Ok(body) => (StatusCode::OK, Json(body)),
+        Err((status, body)) => (status, Json(body)),
+    }
+}
+
+/// P2P 最近邻节点查询接口。
+async fn p2p_nearest_peers_handler(
+    State(state): State<AppState>,
+    Query(query): Query<P2pNearestPeersQuery>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let target_peer_id = query.target_peer_id.trim();
+    if target_peer_id.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "ok": false,
+                "error": "target_peer_id 不能为空"
+            })),
+        );
+    }
+
+    let limit = query.limit.unwrap_or(8);
+    if limit == 0 || limit > 128 {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "ok": false,
+                "error": "limit 必须在 1~128 之间"
+            })),
+        );
+    }
+
+    match with_p2p(&state, |engine| engine.nearest_peers(target_peer_id, limit)) {
+        Ok(peers) => (
+            StatusCode::OK,
+            Json(json!({
+                "ok": true,
+                "target_peer_id": target_peer_id,
+                "limit": limit,
+                "peers": peers
+            })),
+        ),
         Err((status, body)) => (status, Json(body)),
     }
 }
@@ -3058,7 +3158,10 @@ fn now_unix_ts() -> i64 {
 
 #[cfg(test)]
 mod tests {
-    use super::{build_app, default_app_state};
+    use super::{
+        bootstrap_seed_nodes, build_app, chain_status_from_blockchain, default_app_state,
+        parse_seed_node_entry,
+    };
     use axum::{
         body::{to_bytes, Body},
         http::{Method, Request, StatusCode},
@@ -3070,6 +3173,42 @@ mod tests {
     use rustchain_crypto::wallet::create_wallet;
     use serde_json::{json, Value};
     use tower::ServiceExt;
+
+    /// 验证种子节点配置支持 peer_id@address 格式。
+    #[test]
+    fn parse_seed_node_entry_should_support_peer_and_address() {
+        let parsed =
+            parse_seed_node_entry("seed-a@/ip4/127.0.0.1/tcp/7001", 0).expect("应解析成功");
+        assert_eq!(parsed.0, "seed-a");
+        assert_eq!(parsed.1, "/ip4/127.0.0.1/tcp/7001");
+    }
+
+    /// 验证仅地址格式会自动生成节点 ID。
+    #[test]
+    fn parse_seed_node_entry_should_generate_peer_id_for_address_only() {
+        let parsed = parse_seed_node_entry("/ip4/127.0.0.1/tcp/7002", 1).expect("应解析成功");
+        assert_eq!(parsed.0, "seed-2");
+        assert_eq!(parsed.1, "/ip4/127.0.0.1/tcp/7002");
+    }
+
+    /// 验证种子节点导入会同步更新 P2P 引擎和链节点列表。
+    #[test]
+    fn bootstrap_seed_nodes_should_register_to_engine_and_chain() {
+        let mut chain = Blockchain::new(2, 50);
+        let chain_status = chain_status_from_blockchain(&chain);
+        let mut engine = rustchain_p2p::engine::SyncEngine::new("local-node", chain_status);
+        let seed_nodes = vec![
+            "seed-a@/ip4/127.0.0.1/tcp/7001".to_string(),
+            "/ip4/127.0.0.1/tcp/7002".to_string(),
+        ];
+
+        let imported = bootstrap_seed_nodes(&mut engine, &mut chain, &seed_nodes);
+        assert_eq!(imported, 2);
+        assert_eq!(engine.peer_count(), 2);
+        assert_eq!(chain.peers.len(), 2);
+        assert!(engine.peers().get("seed-a").is_some());
+        assert!(engine.peers().get("seed-2").is_some());
+    }
 
     /// 验证基础健康检查接口可用。
     #[tokio::test]
@@ -4148,6 +4287,40 @@ mod tests {
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body["processed"], json!(1));
         assert_eq!(body["outbound_count"], json!(1));
+    }
+
+    /// 验证 P2P 最近邻查询接口可用并返回 limit 条记录。
+    #[tokio::test]
+    async fn p2p_nearest_peers_should_work() {
+        let app = build_test_app();
+        for (peer_id, address) in [
+            ("peer-a", "/ip4/127.0.0.1/tcp/7001"),
+            ("peer-b", "/ip4/127.0.0.1/tcp/7002"),
+            ("peer-c", "/ip4/127.0.0.1/tcp/7003"),
+        ] {
+            let (status, _) = send_json(
+                &app,
+                Method::POST,
+                "/p2p/peer/register",
+                json!({
+                    "peer_id": peer_id,
+                    "address": address
+                }),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK);
+        }
+
+        let (status, body) = send_empty(
+            &app,
+            Method::GET,
+            "/p2p/peers/nearest?target_peer_id=target-1&limit=2",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["ok"], json!(true));
+        let peers = body["peers"].as_array().expect("peers 应为数组");
+        assert_eq!(peers.len(), 2);
     }
 
     /// 验证链交易提交与挖矿会触发 P2P 广播。

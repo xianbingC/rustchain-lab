@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::{
     collections::HashMap,
     time::{SystemTime, UNIX_EPOCH},
@@ -32,6 +33,15 @@ pub struct PeerInfo {
     pub last_seen_secs: u64,
     /// 最近测得的往返延迟（毫秒）。
     pub latency_ms: Option<u64>,
+}
+
+/// Kademlia 风格最近邻查询结果。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PeerDistance {
+    /// 节点信息。
+    pub peer: PeerInfo,
+    /// 目标 ID 与节点 ID 的异或距离（十六进制）。
+    pub xor_distance_hex: String,
 }
 
 impl PeerInfo {
@@ -122,6 +132,40 @@ impl PeerRegistry {
         self.peers.values().cloned().collect()
     }
 
+    /// 按目标节点 ID 返回距离最近的节点列表（Kademlia 异或距离）。
+    pub fn nearest_peers(&self, target_id: &str, limit: usize) -> Vec<PeerDistance> {
+        if target_id.trim().is_empty() || limit == 0 {
+            return Vec::new();
+        }
+
+        let target_digest = digest_node_id(target_id);
+        let mut pairs = self
+            .peers
+            .values()
+            .cloned()
+            .map(|peer| {
+                let distance_bytes = xor_distance_bytes(&target_digest, &digest_node_id(&peer.id));
+                let peer_id = peer.id.clone();
+                (
+                    distance_bytes,
+                    peer_id,
+                    PeerDistance {
+                        peer,
+                        xor_distance_hex: hex::encode(distance_bytes),
+                    },
+                )
+            })
+            .collect::<Vec<_>>();
+
+        // 距离相同按节点 ID 稳定排序，避免返回顺序抖动。
+        pairs.sort_by(|left, right| left.0.cmp(&right.0).then_with(|| left.1.cmp(&right.1)));
+        pairs
+            .into_iter()
+            .take(limit)
+            .map(|(_, _, distance)| distance)
+            .collect()
+    }
+
     /// 标记节点断开。
     pub fn mark_disconnected(&mut self, id: &str) {
         if let Some(peer) = self.peers.get_mut(id) {
@@ -137,6 +181,23 @@ fn now_secs() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_secs())
         .unwrap_or(0)
+}
+
+/// 计算节点 ID 的 SHA-256 摘要，用作 Kademlia 路由键。
+fn digest_node_id(node_id: &str) -> [u8; 32] {
+    let digest = Sha256::digest(node_id.as_bytes());
+    let mut output = [0u8; 32];
+    output.copy_from_slice(&digest);
+    output
+}
+
+/// 计算两段摘要的异或距离。
+fn xor_distance_bytes(left: &[u8; 32], right: &[u8; 32]) -> [u8; 32] {
+    let mut out = [0u8; 32];
+    for (index, slot) in out.iter_mut().enumerate() {
+        *slot = left[index] ^ right[index];
+    }
+    out
 }
 
 #[cfg(test)]
@@ -182,5 +243,28 @@ mod tests {
 
         let snapshot = registry.snapshot();
         assert_eq!(snapshot.len(), 2);
+    }
+
+    /// 验证最近邻查询会按距离排序并应用数量上限。
+    #[test]
+    fn nearest_peers_should_sort_and_limit() {
+        let mut registry = PeerRegistry::new();
+        registry.upsert("node-a", "/ip4/127.0.0.1/tcp/7001");
+        registry.upsert("node-b", "/ip4/127.0.0.1/tcp/7002");
+        registry.upsert("node-c", "/ip4/127.0.0.1/tcp/7003");
+
+        let nearest = registry.nearest_peers("target-node", 2);
+        assert_eq!(nearest.len(), 2);
+        assert!(nearest[0].xor_distance_hex <= nearest[1].xor_distance_hex);
+    }
+
+    /// 验证空目标或零上限会返回空结果。
+    #[test]
+    fn nearest_peers_with_invalid_input_should_return_empty() {
+        let mut registry = PeerRegistry::new();
+        registry.upsert("node-a", "/ip4/127.0.0.1/tcp/7001");
+
+        assert!(registry.nearest_peers("", 5).is_empty());
+        assert!(registry.nearest_peers("target-node", 0).is_empty());
     }
 }

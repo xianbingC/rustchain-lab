@@ -93,7 +93,9 @@ impl NetworkMessage {
     /// 对网络消息进行轻量结构校验，避免无效消息进入业务流程。
     pub fn validate_basic(&self) -> Result<(), MessageValidationError> {
         match self {
-            Self::Ping { .. } | Self::Pong { .. } | Self::GetMempool | Self::GetChainStatus => Ok(()),
+            Self::Ping { .. } | Self::Pong { .. } | Self::GetMempool | Self::GetChainStatus => {
+                Ok(())
+            }
             Self::Handshake(handshake) => handshake.validate_basic(),
             Self::NewTransaction { transaction } => {
                 if transaction.is_empty() {

@@ -550,7 +550,7 @@ fn handle_chain_command(config: &AppConfig, args: &[String]) -> AppResult<()> {
 fn handle_p2p_command(config: &AppConfig, args: &[String]) -> AppResult<()> {
     if args.len() < 2 {
         return Err(AppError::Command(
-            "p2p 命令缺少子命令，可用: status/peers/register-peer/ping/get-chain-status/chain-status/get-blocks/get-mempool"
+            "p2p 命令缺少子命令，可用: status/peers/nearest-peers/register-peer/ping/get-chain-status/chain-status/get-blocks/get-mempool"
                 .to_string(),
         ));
     }
@@ -563,6 +563,24 @@ fn handle_p2p_command(config: &AppConfig, args: &[String]) -> AppResult<()> {
         "peers" => {
             let response = call_api_json(config, Method::GET, "/p2p/peers", None)?;
             print_json("p2p_peers", response)
+        }
+        "nearest-peers" => {
+            let target_peer_id = require_arg(args, 2, "target_peer_id")?;
+            let limit = args
+                .get(3)
+                .map(|raw| {
+                    raw.parse::<usize>()
+                        .map_err(|error| AppError::Command(format!("limit 参数解析失败: {error}")))
+                })
+                .transpose()?
+                .unwrap_or(8);
+            if limit == 0 || limit > 128 {
+                return Err(AppError::Command("limit 必须在 1~128 之间".to_string()));
+            }
+
+            let path = format!("/p2p/peers/nearest?target_peer_id={target_peer_id}&limit={limit}");
+            let response = call_api_json(config, Method::GET, &path, None)?;
+            print_json("p2p_nearest_peers", response)
         }
         "register-peer" => {
             let peer_id = require_arg(args, 2, "peer_id")?;
@@ -1308,6 +1326,7 @@ fn print_help() {
     println!("  rustchain-cli chain history-tx <tx_id>");
     println!("  rustchain-cli p2p status");
     println!("  rustchain-cli p2p peers");
+    println!("  rustchain-cli p2p nearest-peers <target_peer_id> [limit]");
     println!("  rustchain-cli p2p register-peer <peer_id> <address>");
     println!("  rustchain-cli p2p ping <peer_id> <address> <sequence> [nonce]");
     println!("  rustchain-cli p2p get-chain-status <peer_id> <address> <sequence>");
