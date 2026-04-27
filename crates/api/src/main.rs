@@ -737,6 +737,7 @@ fn build_app(shared_state: AppState) -> Router {
         .route("/p2p/status", get(p2p_status_handler))
         .route("/p2p/peers", get(p2p_peers_handler))
         .route("/p2p/sync-target", get(p2p_sync_target_handler))
+        .route("/p2p/sync-gap", get(p2p_sync_gap_handler))
         .route("/p2p/sync-plan", get(p2p_sync_plan_handler))
         .route("/p2p/sync-step", get(p2p_sync_step_handler))
         .route("/p2p/peers/nearest", get(p2p_nearest_peers_handler))
@@ -880,6 +881,57 @@ async fn p2p_sync_target_handler(
         ),
         Err((status, body)) => (status, Json(body)),
     }
+}
+
+/// P2P 同步差距查询接口：展示当前落后高度与追平批次数估算。
+async fn p2p_sync_gap_handler(
+    State(state): State<AppState>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let local_height = match with_chain(&state, |chain| Ok(chain.latest_block()?.index)) {
+        Ok(height) => height,
+        Err((status, body)) => return (status, Json(body)),
+    };
+    let target = match with_p2p(&state, |engine| Ok(engine.select_sync_target())) {
+        Ok(target) => target,
+        Err((status, body)) => return (status, Json(body)),
+    };
+
+    let Some(target) = target else {
+        return (
+            StatusCode::OK,
+            Json(json!({
+                "ok": true,
+                "has_target": false,
+                "local_height": local_height,
+                "target_height": local_height,
+                "gap": 0,
+                "estimated_batches": 0,
+                "next_request": null
+            })),
+        );
+    };
+
+    let target_height = target.best_height;
+    let gap = target_height.saturating_sub(local_height);
+    let estimated_batches = if gap == 0 { 0 } else { (gap + 127) / 128 };
+    let next_request = match build_next_get_blocks_request(&state, &target.id) {
+        Ok(request) => request,
+        Err((status, body)) => return (status, Json(body)),
+    };
+
+    (
+        StatusCode::OK,
+        Json(json!({
+            "ok": true,
+            "has_target": true,
+            "target": target,
+            "local_height": local_height,
+            "target_height": target_height,
+            "gap": gap,
+            "estimated_batches": estimated_batches,
+            "next_request": next_request
+        })),
+    )
 }
 
 /// P2P 同步计划接口：返回当前建议发送的拉块请求。
@@ -4797,6 +4849,58 @@ mod tests {
         assert_eq!(body["target"]["id"], json!("peer-a"));
         assert_eq!(body["plan"]["GetBlocks"]["from_height"], json!(1));
         assert_eq!(body["plan"]["GetBlocks"]["limit"], json!(9));
+    }
+
+    /// 验证同步差距接口会返回高度差和批次数估算。
+    #[tokio::test]
+    async fn p2p_sync_gap_should_return_gap_and_estimated_batches() {
+        let app = build_test_app();
+
+        let (status, _) = send_json(
+            &app,
+            Method::POST,
+            "/p2p/peer/register",
+            json!({
+                "peer_id": "peer-a",
+                "address": "/ip4/127.0.0.1/tcp/7001"
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+
+        let (status, _) = send_json(
+            &app,
+            Method::POST,
+            "/p2p/message",
+            json!({
+                "peer_id": "peer-a",
+                "address": "/ip4/127.0.0.1/tcp/7001",
+                "sequence": 1,
+                "message": {
+                    "ChainStatus": {
+                        "chain_id": "rustchain-lab-dev",
+                        "best_height": 300,
+                        "best_hash": "0x300",
+                        "difficulty": 2,
+                        "genesis_hash": Block::genesis().hash
+                    }
+                }
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+
+        let (status, body) = send_empty(&app, Method::GET, "/p2p/sync-gap").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["ok"], json!(true));
+        assert_eq!(body["has_target"], json!(true));
+        assert_eq!(body["target"]["id"], json!("peer-a"));
+        assert_eq!(body["local_height"], json!(0));
+        assert_eq!(body["target_height"], json!(300));
+        assert_eq!(body["gap"], json!(300));
+        assert_eq!(body["estimated_batches"], json!(3));
+        assert_eq!(body["next_request"]["GetBlocks"]["from_height"], json!(1));
+        assert_eq!(body["next_request"]["GetBlocks"]["limit"], json!(128));
     }
 
     /// 验证同步单步接口会返回可直接执行的拉块动作。
