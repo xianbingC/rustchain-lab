@@ -550,7 +550,7 @@ fn handle_chain_command(config: &AppConfig, args: &[String]) -> AppResult<()> {
 fn handle_p2p_command(config: &AppConfig, args: &[String]) -> AppResult<()> {
     if args.len() < 2 {
         return Err(AppError::Command(
-            "p2p 命令缺少子命令，可用: status/peers/nearest-peers/dht-buckets/bootstrap/register-peer/ping/get-chain-status/find-node/chain-status/get-blocks/get-mempool"
+            "p2p 命令缺少子命令，可用: status/peers/nearest-peers/dht-buckets/bootstrap/discover/register-peer/ping/get-chain-status/find-node/chain-status/get-blocks/get-mempool"
                 .to_string(),
         ));
     }
@@ -608,6 +608,36 @@ fn handle_p2p_command(config: &AppConfig, args: &[String]) -> AppResult<()> {
         "bootstrap" => {
             let response = call_api_json(config, Method::POST, "/p2p/bootstrap", None)?;
             print_json("p2p_bootstrap", response)
+        }
+        "discover" => {
+            let raw_arg1 = args.get(2).map(|value| value.trim()).unwrap_or_default();
+            let raw_arg2 = args.get(3).map(|value| value.trim()).unwrap_or_default();
+
+            let (target_peer_id, limit) = if raw_arg1.is_empty() {
+                (None, 8u8)
+            } else if raw_arg2.is_empty() {
+                match raw_arg1.parse::<u8>() {
+                    Ok(limit) => (None, limit),
+                    Err(_) => (Some(raw_arg1.to_string()), 8u8),
+                }
+            } else {
+                let limit = raw_arg2
+                    .parse::<u8>()
+                    .map_err(|error| AppError::Command(format!("limit 参数解析失败: {error}")))?;
+                (Some(raw_arg1.to_string()), limit)
+            };
+
+            if limit == 0 || limit > 64 {
+                return Err(AppError::Command("limit 必须在 1~64 之间".to_string()));
+            }
+
+            let mut payload = json!({ "limit": limit });
+            if let Some(target_peer_id) = target_peer_id {
+                payload["target_peer_id"] = json!(target_peer_id);
+            }
+
+            let response = call_api_json(config, Method::POST, "/p2p/discover", Some(payload))?;
+            print_json("p2p_discover", response)
         }
         "register-peer" => {
             let peer_id = require_arg(args, 2, "peer_id")?;
@@ -1391,6 +1421,7 @@ fn print_help() {
     println!("  rustchain-cli p2p nearest-peers <target_peer_id> [limit]");
     println!("  rustchain-cli p2p dht-buckets <target_peer_id> [bucket_count]");
     println!("  rustchain-cli p2p bootstrap");
+    println!("  rustchain-cli p2p discover [target_peer_id] [limit]");
     println!("  rustchain-cli p2p register-peer <peer_id> <address>");
     println!("  rustchain-cli p2p ping <peer_id> <address> <sequence> [nonce]");
     println!("  rustchain-cli p2p get-chain-status <peer_id> <address> <sequence>");

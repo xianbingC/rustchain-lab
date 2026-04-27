@@ -205,6 +205,40 @@ impl SyncEngine {
         Ok(outbound)
     }
 
+    /// 构建一轮节点发现请求，将 FindNode 发往全部可用已知节点。
+    pub fn build_find_node_requests(
+        &self,
+        target_peer_id: &str,
+        limit: u8,
+    ) -> P2pResult<Vec<OutboundEnvelope>> {
+        if target_peer_id.trim().is_empty() {
+            return Err(P2pError::InvalidArgument(
+                "target_peer_id 不能为空".to_string(),
+            ));
+        }
+        if limit == 0 || limit > 64 {
+            return Err(P2pError::InvalidArgument(
+                "limit 必须在 1~64 之间".to_string(),
+            ));
+        }
+
+        let mut outbound = self
+            .peers
+            .snapshot()
+            .into_iter()
+            .filter(|peer| peer.id != self.local_peer_id && peer.status != PeerStatus::Disconnected)
+            .map(|peer| OutboundEnvelope {
+                target_peer_id: peer.id,
+                message: NetworkMessage::FindNode {
+                    target_id: target_peer_id.to_string(),
+                    limit,
+                },
+            })
+            .collect::<Vec<_>>();
+        outbound.sort_by(|left, right| left.target_peer_id.cmp(&right.target_peer_id));
+        Ok(outbound)
+    }
+
     /// 获取某节点的下一期望序号。
     pub fn next_expected_sequence(&self, peer_id: &str) -> Option<u64> {
         self.queues
@@ -312,12 +346,20 @@ impl SyncEngine {
                     message: NetworkMessage::Blocks { blocks: Vec::new() },
                 });
             }
+            NetworkMessage::Nodes { peers } => {
+                // 收到节点发现结果后写入本地注册表，作为后续连接候选。
+                for discovered in peers {
+                    if discovered.peer_id == self.local_peer_id {
+                        continue;
+                    }
+                    self.register_peer(discovered.peer_id, discovered.address);
+                }
+            }
             NetworkMessage::Pong { .. }
             | NetworkMessage::NewTransaction { .. }
             | NetworkMessage::NewBlock { .. }
             | NetworkMessage::Blocks { .. }
-            | NetworkMessage::Mempool { .. }
-            | NetworkMessage::Nodes { .. } => {}
+            | NetworkMessage::Mempool { .. } => {}
         }
 
         Ok(outbound)
@@ -531,5 +573,54 @@ mod tests {
             NetworkMessage::Nodes { peers } => assert_eq!(peers.len(), 2),
             _ => panic!("应返回 nodes 响应"),
         }
+    }
+
+    /// 验证 nodes 消息会导入发现节点到注册表。
+    #[test]
+    fn nodes_message_should_register_discovered_peers() {
+        let mut engine = SyncEngine::new("local-node", local_status(2));
+        engine.register_peer("peer-a", "/ip4/127.0.0.1/tcp/7001");
+        assert_eq!(engine.peer_count(), 1);
+
+        let report = engine
+            .on_incoming_message(
+                "peer-a",
+                "/ip4/127.0.0.1/tcp/7001",
+                1,
+                NetworkMessage::Nodes {
+                    peers: vec![
+                        DiscoveredPeer {
+                            peer_id: "peer-b".to_string(),
+                            address: "/ip4/127.0.0.1/tcp/7002".to_string(),
+                        },
+                        DiscoveredPeer {
+                            peer_id: "peer-c".to_string(),
+                            address: "/ip4/127.0.0.1/tcp/7003".to_string(),
+                        },
+                    ],
+                },
+            )
+            .expect("处理 nodes 应成功");
+        assert_eq!(report.outbound.len(), 0);
+        assert_eq!(engine.peer_count(), 3);
+        assert!(engine.peers().get("peer-b").is_some());
+        assert!(engine.peers().get("peer-c").is_some());
+    }
+
+    /// 验证可构建批量 find_node 请求。
+    #[test]
+    fn build_find_node_requests_should_work() {
+        let mut engine = SyncEngine::new("local-node", local_status(2));
+        engine.register_peer("peer-a", "/ip4/127.0.0.1/tcp/7001");
+        engine.register_peer("peer-b", "/ip4/127.0.0.1/tcp/7002");
+
+        let outbound = engine
+            .build_find_node_requests("target-node", 3)
+            .expect("构建发现请求应成功");
+        assert_eq!(outbound.len(), 2);
+        assert!(matches!(
+            outbound[0].message,
+            NetworkMessage::FindNode { .. }
+        ));
     }
 }

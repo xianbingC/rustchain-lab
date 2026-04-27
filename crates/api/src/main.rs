@@ -282,6 +282,15 @@ struct P2pDhtBucketsQuery {
     bucket_count: Option<u8>,
 }
 
+/// P2P 批量发现请求参数。
+#[derive(Debug, Deserialize)]
+struct P2pDiscoverRequest {
+    /// 目标节点 ID，缺省时使用本地节点 ID。
+    target_peer_id: Option<String>,
+    /// 单个请求返回上限（默认 8）。
+    limit: Option<u8>,
+}
+
 /// P2P 入站消息请求。
 #[derive(Debug, Deserialize)]
 struct P2pIncomingMessageRequest {
@@ -720,6 +729,7 @@ fn build_app(shared_state: AppState) -> Router {
         .route("/p2p/peers/nearest", get(p2p_nearest_peers_handler))
         .route("/p2p/dht/buckets", get(p2p_dht_buckets_handler))
         .route("/p2p/bootstrap", post(p2p_bootstrap_handler))
+        .route("/p2p/discover", post(p2p_discover_handler))
         .route("/p2p/peer/register", post(p2p_register_peer_handler))
         .route("/p2p/message", post(p2p_message_handler))
         .route("/chain/info", get(chain_info_handler))
@@ -932,6 +942,50 @@ async fn p2p_bootstrap_handler(
                 "ok": true,
                 "listen_addr": listen_addr,
                 "protocol_version": protocol_version,
+                "outbound_count": outbound.len(),
+                "outbound": outbound
+            })),
+        ),
+        Err((status, body)) => (status, Json(body)),
+    }
+}
+
+/// P2P 批量发现接口：为已知节点生成一轮 FindNode 请求。
+async fn p2p_discover_handler(
+    State(state): State<AppState>,
+    Json(payload): Json<P2pDiscoverRequest>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let limit = payload.limit.unwrap_or(8);
+    if limit == 0 || limit > 64 {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "ok": false,
+                "error": "limit 必须在 1~64 之间"
+            })),
+        );
+    }
+
+    let target_peer_id = payload
+        .target_peer_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned);
+
+    match with_p2p(&state, |engine| {
+        let target = target_peer_id
+            .clone()
+            .unwrap_or_else(|| engine.local_peer_id().to_string());
+        let outbound = engine.build_find_node_requests(&target, limit)?;
+        Ok((target, outbound))
+    }) {
+        Ok((target, outbound)) => (
+            StatusCode::OK,
+            Json(json!({
+                "ok": true,
+                "target_peer_id": target,
+                "limit": limit,
                 "outbound_count": outbound.len(),
                 "outbound": outbound
             })),
@@ -1187,6 +1241,17 @@ async fn p2p_message_handler(
                         blocks: encoded_blocks,
                     },
                 });
+            }
+        }
+        NetworkMessage::Nodes { peers } => {
+            // 将发现节点同步到链节点列表，便于链侧统计和运维观察。
+            if let Err((status, body)) = with_chain_mut(&state, |chain| {
+                for peer in peers {
+                    chain.add_peer(peer.address);
+                }
+                Ok(())
+            }) {
+                return (status, Json(body));
             }
         }
         _ => {}
@@ -4492,6 +4557,60 @@ mod tests {
         assert_eq!(peers.len(), 2);
     }
 
+    /// 验证接收 nodes 消息后会导入发现节点。
+    #[tokio::test]
+    async fn p2p_nodes_should_import_discovered_peers() {
+        let app = build_test_app();
+        let (status, _) = send_json(
+            &app,
+            Method::POST,
+            "/p2p/peer/register",
+            json!({
+                "peer_id": "peer-a",
+                "address": "/ip4/127.0.0.1/tcp/7001"
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+
+        let (status, body) = send_json(
+            &app,
+            Method::POST,
+            "/p2p/message",
+            json!({
+                "peer_id": "peer-a",
+                "address": "/ip4/127.0.0.1/tcp/7001",
+                "sequence": 1,
+                "message": {
+                    "Nodes": {
+                        "peers": [
+                            {
+                                "peer_id": "peer-b",
+                                "address": "/ip4/127.0.0.1/tcp/7002"
+                            },
+                            {
+                                "peer_id": "peer-c",
+                                "address": "/ip4/127.0.0.1/tcp/7003"
+                            }
+                        ]
+                    }
+                }
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["ok"], json!(true));
+
+        let (status, body) = send_empty(&app, Method::GET, "/p2p/peers").await;
+        assert_eq!(status, StatusCode::OK);
+        let peers = body["peers"].as_array().expect("peers 应为数组");
+        assert_eq!(peers.len(), 3);
+
+        let (status, body) = send_empty(&app, Method::GET, "/chain/info").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["chain"]["peer_count"], json!(3));
+    }
+
     /// 验证 P2P 启动引导会仅返回待握手节点。
     #[tokio::test]
     async fn p2p_bootstrap_should_only_include_unconnected_peers() {
@@ -4536,6 +4655,50 @@ mod tests {
         assert_eq!(
             body["outbound"][0]["message"]["Handshake"]["protocol_version"],
             json!("1.0.0")
+        );
+    }
+
+    /// 验证 P2P 批量发现接口会构建 find_node 请求。
+    #[tokio::test]
+    async fn p2p_discover_should_build_find_node_requests() {
+        let app = build_test_app();
+        for (peer_id, address) in [
+            ("peer-a", "/ip4/127.0.0.1/tcp/7001"),
+            ("peer-b", "/ip4/127.0.0.1/tcp/7002"),
+        ] {
+            let (status, _) = send_json(
+                &app,
+                Method::POST,
+                "/p2p/peer/register",
+                json!({
+                    "peer_id": peer_id,
+                    "address": address
+                }),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK);
+        }
+
+        let (status, body) = send_json(
+            &app,
+            Method::POST,
+            "/p2p/discover",
+            json!({
+                "target_peer_id": "target-discover",
+                "limit": 3
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["ok"], json!(true));
+        assert_eq!(body["outbound_count"], json!(2));
+        assert_eq!(
+            body["outbound"][0]["message"]["FindNode"]["target_id"],
+            json!("target-discover")
+        );
+        assert_eq!(
+            body["outbound"][0]["message"]["FindNode"]["limit"],
+            json!(3)
         );
     }
 
