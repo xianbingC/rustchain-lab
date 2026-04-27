@@ -2,10 +2,11 @@ use crate::{
     codec::MessageCodec,
     error::{P2pError, P2pResult},
     message::{ChainStatus, DiscoveredPeer, Handshake, NetworkMessage},
-    peer::{DhtBucket, PeerDistance, PeerRegistry, PeerStatus},
+    peer::{DhtBucket, PeerDistance, PeerInfo, PeerRegistry, PeerStatus},
     queue::{OrderedMessageQueue, SequencedMessage},
 };
 use serde::{Deserialize, Serialize};
+use std::cmp::Ordering;
 use std::collections::HashMap;
 
 /// 待发送消息信封，交给传输层处理。
@@ -166,6 +167,19 @@ impl SyncEngine {
         }
 
         Ok(self.peers.dht_buckets(target_peer_id, bucket_count))
+    }
+
+    /// 选择最优同步目标节点（仅返回高于本地高度的候选）。
+    pub fn select_sync_target(&self) -> Option<PeerInfo> {
+        let mut candidates = self
+            .peers
+            .snapshot()
+            .into_iter()
+            .filter(|peer| peer.best_height > self.local_chain_status.best_height)
+            .collect::<Vec<_>>();
+
+        candidates.sort_by(compare_sync_priority);
+        candidates.into_iter().next()
     }
 
     /// 为未连接节点构建启动握手消息列表，交由传输层逐个发送。
@@ -364,6 +378,30 @@ impl SyncEngine {
 
         Ok(outbound)
     }
+}
+
+/// 比较两个候选节点的同步优先级（返回 Ordering::Less 表示 left 更优先）。
+fn compare_sync_priority(left: &PeerInfo, right: &PeerInfo) -> Ordering {
+    let left_connected = left.status == PeerStatus::Connected;
+    let right_connected = right.status == PeerStatus::Connected;
+    match right_connected.cmp(&left_connected) {
+        Ordering::Equal => {}
+        other => return other,
+    }
+
+    match right.best_height.cmp(&left.best_height) {
+        Ordering::Equal => {}
+        other => return other,
+    }
+
+    let left_latency = left.latency_ms.unwrap_or(u64::MAX);
+    let right_latency = right.latency_ms.unwrap_or(u64::MAX);
+    match left_latency.cmp(&right_latency) {
+        Ordering::Equal => {}
+        other => return other,
+    }
+
+    right.last_seen_secs.cmp(&left.last_seen_secs)
 }
 
 #[cfg(test)]
@@ -622,5 +660,38 @@ mod tests {
             outbound[0].message,
             NetworkMessage::FindNode { .. }
         ));
+    }
+
+    /// 验证同步目标会优先选择已连接且高度更高的节点。
+    #[test]
+    fn select_sync_target_should_prefer_connected_and_higher_height() {
+        let mut engine = SyncEngine::new("local-node", local_status(2));
+        engine.register_peer("peer-a", "/ip4/127.0.0.1/tcp/7001");
+        engine.register_peer("peer-b", "/ip4/127.0.0.1/tcp/7002");
+        engine.register_peer("peer-c", "/ip4/127.0.0.1/tcp/7003");
+
+        engine
+            .on_incoming_message(
+                "peer-a",
+                "/ip4/127.0.0.1/tcp/7001",
+                1,
+                NetworkMessage::ChainStatus(local_status(10)),
+            )
+            .expect("处理应成功");
+        engine
+            .on_incoming_message(
+                "peer-b",
+                "/ip4/127.0.0.1/tcp/7002",
+                1,
+                NetworkMessage::ChainStatus(local_status(8)),
+            )
+            .expect("处理应成功");
+        // peer-c 保持未连接状态，即使高度更高也不应优先。
+        if let Some(peer) = engine.peers.get_mut("peer-c") {
+            peer.update_chain_tip(12, "0x12");
+        }
+
+        let target = engine.select_sync_target().expect("应存在同步目标");
+        assert_eq!(target.id, "peer-a");
     }
 }

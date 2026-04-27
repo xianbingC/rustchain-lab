@@ -736,6 +736,7 @@ fn build_app(shared_state: AppState) -> Router {
         .route("/tx/verify", post(tx_verify_handler))
         .route("/p2p/status", get(p2p_status_handler))
         .route("/p2p/peers", get(p2p_peers_handler))
+        .route("/p2p/sync-target", get(p2p_sync_target_handler))
         .route("/p2p/peers/nearest", get(p2p_nearest_peers_handler))
         .route("/p2p/dht/buckets", get(p2p_dht_buckets_handler))
         .route("/p2p/bootstrap", post(p2p_bootstrap_handler))
@@ -850,6 +851,31 @@ async fn p2p_peers_handler(State(state): State<AppState>) -> (StatusCode, Json<s
         }))
     }) {
         Ok(body) => (StatusCode::OK, Json(body)),
+        Err((status, body)) => (status, Json(body)),
+    }
+}
+
+/// P2P 同步目标查询接口：返回当前最优拉块节点。
+async fn p2p_sync_target_handler(
+    State(state): State<AppState>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    match with_p2p(&state, |engine| Ok(engine.select_sync_target())) {
+        Ok(Some(target)) => (
+            StatusCode::OK,
+            Json(json!({
+                "ok": true,
+                "has_target": true,
+                "target": target
+            })),
+        ),
+        Ok(None) => (
+            StatusCode::OK,
+            Json(json!({
+                "ok": true,
+                "has_target": false,
+                "target": null
+            })),
+        ),
         Err((status, body)) => (status, Json(body)),
     }
 }
@@ -4551,6 +4577,79 @@ mod tests {
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body["processed"], json!(1));
         assert_eq!(body["outbound_count"], json!(1));
+    }
+
+    /// 验证同步目标接口会返回最优候选节点。
+    #[tokio::test]
+    async fn p2p_sync_target_should_return_best_candidate() {
+        let app = build_test_app();
+        for (peer_id, address) in [
+            ("peer-a", "/ip4/127.0.0.1/tcp/7001"),
+            ("peer-b", "/ip4/127.0.0.1/tcp/7002"),
+            ("peer-c", "/ip4/127.0.0.1/tcp/7003"),
+        ] {
+            let (status, _) = send_json(
+                &app,
+                Method::POST,
+                "/p2p/peer/register",
+                json!({
+                    "peer_id": peer_id,
+                    "address": address
+                }),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK);
+        }
+
+        let (status, _) = send_json(
+            &app,
+            Method::POST,
+            "/p2p/message",
+            json!({
+                "peer_id": "peer-a",
+                "address": "/ip4/127.0.0.1/tcp/7001",
+                "sequence": 1,
+                "message": {
+                    "ChainStatus": {
+                        "chain_id": "rustchain-lab-dev",
+                        "best_height": 12,
+                        "best_hash": "0x12",
+                        "difficulty": 2,
+                        "genesis_hash": Block::genesis().hash
+                    }
+                }
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+
+        let (status, _) = send_json(
+            &app,
+            Method::POST,
+            "/p2p/message",
+            json!({
+                "peer_id": "peer-b",
+                "address": "/ip4/127.0.0.1/tcp/7002",
+                "sequence": 1,
+                "message": {
+                    "ChainStatus": {
+                        "chain_id": "rustchain-lab-dev",
+                        "best_height": 10,
+                        "best_hash": "0x10",
+                        "difficulty": 2,
+                        "genesis_hash": Block::genesis().hash
+                    }
+                }
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+
+        let (status, body) = send_empty(&app, Method::GET, "/p2p/sync-target").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["ok"], json!(true));
+        assert_eq!(body["has_target"], json!(true));
+        assert_eq!(body["target"]["id"], json!("peer-a"));
     }
 
     /// 验证 P2P 最近邻查询接口可用并返回 limit 条记录。

@@ -550,7 +550,7 @@ fn handle_chain_command(config: &AppConfig, args: &[String]) -> AppResult<()> {
 fn handle_p2p_command(config: &AppConfig, args: &[String]) -> AppResult<()> {
     if args.len() < 2 {
         return Err(AppError::Command(
-            "p2p 命令缺少子命令，可用: status/peers/nearest-peers/dht-buckets/bootstrap/discover/diagnose/register-peer/ping/get-chain-status/find-node/chain-status/get-blocks/get-mempool"
+            "p2p 命令缺少子命令，可用: status/peers/sync-target/nearest-peers/dht-buckets/bootstrap/discover/diagnose/register-peer/ping/get-chain-status/find-node/chain-status/get-blocks/get-mempool"
                 .to_string(),
         ));
     }
@@ -563,6 +563,10 @@ fn handle_p2p_command(config: &AppConfig, args: &[String]) -> AppResult<()> {
         "peers" => {
             let response = call_api_json(config, Method::GET, "/p2p/peers", None)?;
             print_json("p2p_peers", response)
+        }
+        "sync-target" => {
+            let response = call_api_json(config, Method::GET, "/p2p/sync-target", None)?;
+            print_json("p2p_sync_target", response)
         }
         "nearest-peers" => {
             let target_peer_id = require_arg(args, 2, "target_peer_id")?;
@@ -1448,6 +1452,7 @@ fn print_help() {
     println!("  rustchain-cli chain history-tx <tx_id>");
     println!("  rustchain-cli p2p status");
     println!("  rustchain-cli p2p peers");
+    println!("  rustchain-cli p2p sync-target");
     println!("  rustchain-cli p2p nearest-peers <target_peer_id> [limit]");
     println!("  rustchain-cli p2p dht-buckets <target_peer_id> [bucket_count]");
     println!("  rustchain-cli p2p bootstrap");
