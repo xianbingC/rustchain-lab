@@ -16,6 +16,7 @@ use rustchain_crypto::wallet::{
 use rustchain_p2p::{
     engine::{OutboundEnvelope, SyncEngine},
     message::{ChainStatus, NetworkMessage},
+    peer::PeerStatus,
 };
 #[cfg(any(test, not(feature = "rocksdb-backend")))]
 use rustchain_storage::state::InMemoryStateStore;
@@ -288,6 +289,15 @@ struct P2pDiscoverRequest {
     /// 目标节点 ID，缺省时使用本地节点 ID。
     target_peer_id: Option<String>,
     /// 单个请求返回上限（默认 8）。
+    limit: Option<u8>,
+}
+
+/// P2P 诊断请求参数。
+#[derive(Debug, Default, Deserialize)]
+struct P2pDiagnoseRequest {
+    /// 诊断目标节点 ID，缺省时使用本地节点 ID。
+    target_peer_id: Option<String>,
+    /// 最近邻/发现请求上限（默认 8）。
     limit: Option<u8>,
 }
 
@@ -730,6 +740,7 @@ fn build_app(shared_state: AppState) -> Router {
         .route("/p2p/dht/buckets", get(p2p_dht_buckets_handler))
         .route("/p2p/bootstrap", post(p2p_bootstrap_handler))
         .route("/p2p/discover", post(p2p_discover_handler))
+        .route("/p2p/diagnose", post(p2p_diagnose_handler))
         .route("/p2p/peer/register", post(p2p_register_peer_handler))
         .route("/p2p/message", post(p2p_message_handler))
         .route("/chain/info", get(chain_info_handler))
@@ -988,6 +999,107 @@ async fn p2p_discover_handler(
                 "limit": limit,
                 "outbound_count": outbound.len(),
                 "outbound": outbound
+            })),
+        ),
+        Err((status, body)) => (status, Json(body)),
+    }
+}
+
+/// P2P 诊断接口：汇总节点发现状态并给出下一步动作建议。
+async fn p2p_diagnose_handler(
+    State(state): State<AppState>,
+    Json(payload): Json<P2pDiagnoseRequest>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let limit = payload.limit.unwrap_or(8);
+    if limit == 0 || limit > 64 {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "ok": false,
+                "error": "limit 必须在 1~64 之间"
+            })),
+        );
+    }
+
+    let listen_addr = state.p2p_listen_addr.clone();
+    let protocol_version = state.p2p_protocol_version.clone();
+    let target_peer_id = payload
+        .target_peer_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned);
+
+    match with_p2p(&state, |engine| {
+        let target = target_peer_id
+            .clone()
+            .unwrap_or_else(|| engine.local_peer_id().to_string());
+        let snapshot = engine.peer_snapshot();
+        let connected_count = snapshot
+            .iter()
+            .filter(|peer| peer.status == PeerStatus::Connected)
+            .count();
+        let bootstrap_outbound =
+            engine.build_bootstrap_handshakes(&listen_addr, &protocol_version)?;
+        let discover_outbound = engine.build_find_node_requests(&target, limit)?;
+        let nearest_peers = engine.nearest_peers(&target, limit as usize)?;
+
+        let mut suggestions = Vec::new();
+        if snapshot.is_empty() {
+            suggestions.push("当前没有已知节点，请先 register-peer 或配置 seed_nodes".to_string());
+        }
+        if !bootstrap_outbound.is_empty() {
+            suggestions.push(format!(
+                "建议先发送 bootstrap 握手，共 {} 条待发送消息",
+                bootstrap_outbound.len()
+            ));
+        }
+        if !discover_outbound.is_empty() {
+            suggestions.push(format!(
+                "建议随后发送 discover 请求，共 {} 条待发送消息",
+                discover_outbound.len()
+            ));
+        }
+        if nearest_peers.is_empty() {
+            suggestions.push("暂无最近邻结果，等待 nodes 响应后再继续诊断".to_string());
+        }
+        if connected_count == 0 && !snapshot.is_empty() {
+            suggestions.push("当前已知节点均未连接，可先执行 bootstrap 建立握手".to_string());
+        }
+
+        Ok((
+            target,
+            snapshot.len(),
+            connected_count,
+            bootstrap_outbound,
+            discover_outbound,
+            nearest_peers,
+            suggestions,
+        ))
+    }) {
+        Ok((
+            target,
+            peer_count,
+            connected_count,
+            bootstrap_outbound,
+            discover_outbound,
+            nearest_peers,
+            suggestions,
+        )) => (
+            StatusCode::OK,
+            Json(json!({
+                "ok": true,
+                "target_peer_id": target,
+                "limit": limit,
+                "peer_count": peer_count,
+                "connected_count": connected_count,
+                "bootstrap_outbound_count": bootstrap_outbound.len(),
+                "discover_outbound_count": discover_outbound.len(),
+                "nearest_peer_count": nearest_peers.len(),
+                "bootstrap_outbound": bootstrap_outbound,
+                "discover_outbound": discover_outbound,
+                "nearest_peers": nearest_peers,
+                "suggestions": suggestions
             })),
         ),
         Err((status, body)) => (status, Json(body)),
@@ -4700,6 +4812,48 @@ mod tests {
             body["outbound"][0]["message"]["FindNode"]["limit"],
             json!(3)
         );
+    }
+
+    /// 验证 P2P 诊断接口会返回状态摘要与建议动作。
+    #[tokio::test]
+    async fn p2p_diagnose_should_return_summary_and_suggestions() {
+        let app = build_test_app();
+        for (peer_id, address) in [
+            ("peer-a", "/ip4/127.0.0.1/tcp/7001"),
+            ("peer-b", "/ip4/127.0.0.1/tcp/7002"),
+        ] {
+            let (status, _) = send_json(
+                &app,
+                Method::POST,
+                "/p2p/peer/register",
+                json!({
+                    "peer_id": peer_id,
+                    "address": address
+                }),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK);
+        }
+
+        let (status, body) = send_json(
+            &app,
+            Method::POST,
+            "/p2p/diagnose",
+            json!({
+                "target_peer_id": "target-diagnose",
+                "limit": 2
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["ok"], json!(true));
+        assert_eq!(body["peer_count"], json!(2));
+        assert_eq!(body["discover_outbound_count"], json!(2));
+        assert_eq!(body["nearest_peer_count"], json!(2));
+        let suggestions = body["suggestions"]
+            .as_array()
+            .expect("suggestions 应为数组");
+        assert!(!suggestions.is_empty());
     }
 
     /// 验证链交易提交与挖矿会触发 P2P 广播。
