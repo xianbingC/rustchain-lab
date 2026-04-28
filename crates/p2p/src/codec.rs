@@ -102,6 +102,73 @@ impl FramedMessageCodec {
     }
 }
 
+/// 流式帧解码缓冲区，用于处理 TCP 常见的半包和粘包场景。
+#[derive(Debug, Clone)]
+pub struct FrameDecodeBuffer {
+    buffer: Vec<u8>,
+    max_frame_len: usize,
+}
+
+impl Default for FrameDecodeBuffer {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl FrameDecodeBuffer {
+    /// 使用默认最大帧长度创建缓冲区。
+    pub fn new() -> Self {
+        Self::with_max_frame_len(DEFAULT_MAX_FRAME_LEN)
+    }
+
+    /// 使用自定义最大帧长度创建缓冲区，便于测试和不同节点配置复用。
+    pub fn with_max_frame_len(max_frame_len: usize) -> Self {
+        Self {
+            buffer: Vec::new(),
+            max_frame_len,
+        }
+    }
+
+    /// 追加本次从网络读取到的字节；空切片不改变缓冲区。
+    pub fn push(&mut self, data: &[u8]) {
+        if !data.is_empty() {
+            self.buffer.extend_from_slice(data);
+        }
+    }
+
+    /// 尝试弹出一条完整消息；如果当前只有半包，则返回 None。
+    pub fn next_message(&mut self) -> P2pResult<Option<NetworkMessage>> {
+        let Some(decoded) =
+            FramedMessageCodec::decode_frame_with_max_len(&self.buffer, self.max_frame_len)?
+        else {
+            return Ok(None);
+        };
+
+        // drain 在丢弃迭代器时才真正移除数据，因此这里显式 drop。
+        drop(self.buffer.drain(..decoded.consumed));
+        Ok(Some(decoded.message))
+    }
+
+    /// 尽可能取出当前缓冲区里的所有完整消息，末尾半包会继续保留。
+    pub fn drain_messages(&mut self) -> P2pResult<Vec<NetworkMessage>> {
+        let mut messages = Vec::new();
+        while let Some(message) = self.next_message()? {
+            messages.push(message);
+        }
+        Ok(messages)
+    }
+
+    /// 返回尚未消费的字节数，便于诊断半包和粘包处理状态。
+    pub fn buffered_len(&self) -> usize {
+        self.buffer.len()
+    }
+
+    /// 判断当前是否没有缓存任何待处理字节。
+    pub fn is_empty(&self) -> bool {
+        self.buffer.is_empty()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -172,5 +239,79 @@ mod tests {
         let result = FramedMessageCodec::encode_frame_with_max_len(&msg, 1);
 
         assert!(matches!(result, Err(P2pError::InvalidArgument(_))));
+    }
+
+    /// 验证流式缓冲区遇到半包时会保留数据，等待后续字节补齐。
+    #[test]
+    fn frame_decode_buffer_should_wait_until_full_frame() {
+        let msg = NetworkMessage::GetMempool;
+        let frame = FramedMessageCodec::encode_frame(&msg).expect("帧编码应成功");
+        let split_at = frame.len() / 2;
+
+        let mut buffer = FrameDecodeBuffer::new();
+        buffer.push(&frame[..split_at]);
+
+        let first = buffer.next_message().expect("半包解析不应报错");
+        assert!(first.is_none());
+        assert_eq!(buffer.buffered_len(), split_at);
+
+        buffer.push(&frame[split_at..]);
+        let second = buffer
+            .next_message()
+            .expect("完整帧解析应成功")
+            .expect("补齐后应返回消息");
+
+        assert_eq!(second, msg);
+        assert!(buffer.is_empty());
+    }
+
+    /// 验证粘包场景下可以一次性拆出多条完整消息。
+    #[test]
+    fn frame_decode_buffer_should_drain_multiple_frames_from_sticky_packet() {
+        let msg1 = NetworkMessage::GetMempool;
+        let msg2 = NetworkMessage::GetBlocks {
+            from_height: 8,
+            limit: 4,
+        };
+        let mut packet = FramedMessageCodec::encode_frame(&msg1).expect("第一帧编码应成功");
+        packet.extend(FramedMessageCodec::encode_frame(&msg2).expect("第二帧编码应成功"));
+
+        let mut buffer = FrameDecodeBuffer::new();
+        buffer.push(&packet);
+
+        let messages = buffer.drain_messages().expect("粘包拆包应成功");
+
+        assert_eq!(messages, vec![msg1, msg2]);
+        assert!(buffer.is_empty());
+    }
+
+    /// 验证批量拆包后会保留末尾未完成的下一帧。
+    #[test]
+    fn frame_decode_buffer_should_keep_partial_tail_after_drain() {
+        let msg1 = NetworkMessage::GetMempool;
+        let msg2 = NetworkMessage::GetBlocks {
+            from_height: 9,
+            limit: 2,
+        };
+        let frame1 = FramedMessageCodec::encode_frame(&msg1).expect("第一帧编码应成功");
+        let frame2 = FramedMessageCodec::encode_frame(&msg2).expect("第二帧编码应成功");
+        let split_at = frame2.len() - 1;
+
+        let mut packet = frame1;
+        packet.extend_from_slice(&frame2[..split_at]);
+
+        let mut buffer = FrameDecodeBuffer::new();
+        buffer.push(&packet);
+
+        let messages = buffer.drain_messages().expect("批量拆包应成功");
+
+        assert_eq!(messages, vec![msg1]);
+        assert_eq!(buffer.buffered_len(), split_at);
+
+        buffer.push(&frame2[split_at..]);
+        let tail = buffer.drain_messages().expect("尾帧补齐后应成功");
+
+        assert_eq!(tail, vec![msg2]);
+        assert!(buffer.is_empty());
     }
 }
