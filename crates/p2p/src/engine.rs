@@ -171,15 +171,19 @@ impl SyncEngine {
 
     /// 选择最优同步目标节点（仅返回高于本地高度的候选）。
     pub fn select_sync_target(&self) -> Option<PeerInfo> {
+        self.sync_candidates().into_iter().next()
+    }
+
+    /// 返回所有可同步候选节点（按优先级排序）。
+    pub fn sync_candidates(&self) -> Vec<PeerInfo> {
         let mut candidates = self
             .peers
             .snapshot()
             .into_iter()
             .filter(|peer| peer.best_height > self.local_chain_status.best_height)
             .collect::<Vec<_>>();
-
         candidates.sort_by(compare_sync_priority);
-        candidates.into_iter().next()
+        candidates
     }
 
     /// 为未连接节点构建启动握手消息列表，交由传输层逐个发送。
@@ -693,5 +697,47 @@ mod tests {
 
         let target = engine.select_sync_target().expect("应存在同步目标");
         assert_eq!(target.id, "peer-a");
+    }
+
+    /// 验证同步候选列表会按优先级排序。
+    #[test]
+    fn sync_candidates_should_be_sorted_by_priority() {
+        let mut engine = SyncEngine::new("local-node", local_status(2));
+        engine.register_peer("peer-a", "/ip4/127.0.0.1/tcp/7001");
+        engine.register_peer("peer-b", "/ip4/127.0.0.1/tcp/7002");
+        engine.register_peer("peer-c", "/ip4/127.0.0.1/tcp/7003");
+
+        engine
+            .on_incoming_message(
+                "peer-a",
+                "/ip4/127.0.0.1/tcp/7001",
+                1,
+                NetworkMessage::ChainStatus(local_status(15)),
+            )
+            .expect("处理应成功");
+        engine
+            .on_incoming_message(
+                "peer-b",
+                "/ip4/127.0.0.1/tcp/7002",
+                1,
+                NetworkMessage::ChainStatus(local_status(20)),
+            )
+            .expect("处理应成功");
+        if let Some(peer) = engine.peers.get_mut("peer-b") {
+            peer.latency_ms = Some(40);
+        }
+        if let Some(peer) = engine.peers.get_mut("peer-a") {
+            peer.latency_ms = Some(15);
+        }
+        // peer-c 保持未连接，理论上优先级应低于已连接节点。
+        if let Some(peer) = engine.peers.get_mut("peer-c") {
+            peer.update_chain_tip(30, "0x30");
+        }
+
+        let candidates = engine.sync_candidates();
+        assert_eq!(candidates.len(), 3);
+        assert_eq!(candidates[0].id, "peer-b");
+        assert_eq!(candidates[1].id, "peer-a");
+        assert_eq!(candidates[2].id, "peer-c");
     }
 }

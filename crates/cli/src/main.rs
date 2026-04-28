@@ -550,7 +550,7 @@ fn handle_chain_command(config: &AppConfig, args: &[String]) -> AppResult<()> {
 fn handle_p2p_command(config: &AppConfig, args: &[String]) -> AppResult<()> {
     if args.len() < 2 {
         return Err(AppError::Command(
-            "p2p 命令缺少子命令，可用: status/peers/sync-target/sync-gap/sync-plan/sync-step/nearest-peers/dht-buckets/bootstrap/discover/diagnose/register-peer/ping/get-chain-status/find-node/chain-status/get-blocks/get-mempool"
+            "p2p 命令缺少子命令，可用: status/peers/sync-candidates/sync-target/sync-gap/sync-plan/sync-step/nearest-peers/dht-buckets/bootstrap/discover/diagnose/register-peer/ping/get-chain-status/find-node/chain-status/get-blocks/get-mempool"
                 .to_string(),
         ));
     }
@@ -563,6 +563,10 @@ fn handle_p2p_command(config: &AppConfig, args: &[String]) -> AppResult<()> {
         "peers" => {
             let response = call_api_json(config, Method::GET, "/p2p/peers", None)?;
             print_json("p2p_peers", response)
+        }
+        "sync-candidates" => {
+            let response = call_api_json(config, Method::GET, "/p2p/sync-candidates", None)?;
+            print_json("p2p_sync_candidates", response)
         }
         "sync-target" => {
             let response = call_api_json(config, Method::GET, "/p2p/sync-target", None)?;
@@ -1464,6 +1468,7 @@ fn print_help() {
     println!("  rustchain-cli chain history-tx <tx_id>");
     println!("  rustchain-cli p2p status");
     println!("  rustchain-cli p2p peers");
+    println!("  rustchain-cli p2p sync-candidates");
     println!("  rustchain-cli p2p sync-target");
     println!("  rustchain-cli p2p sync-gap");
     println!("  rustchain-cli p2p sync-plan");

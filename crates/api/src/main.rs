@@ -736,6 +736,7 @@ fn build_app(shared_state: AppState) -> Router {
         .route("/tx/verify", post(tx_verify_handler))
         .route("/p2p/status", get(p2p_status_handler))
         .route("/p2p/peers", get(p2p_peers_handler))
+        .route("/p2p/sync-candidates", get(p2p_sync_candidates_handler))
         .route("/p2p/sync-target", get(p2p_sync_target_handler))
         .route("/p2p/sync-gap", get(p2p_sync_gap_handler))
         .route("/p2p/sync-plan", get(p2p_sync_plan_handler))
@@ -854,6 +855,24 @@ async fn p2p_peers_handler(State(state): State<AppState>) -> (StatusCode, Json<s
         }))
     }) {
         Ok(body) => (StatusCode::OK, Json(body)),
+        Err((status, body)) => (status, Json(body)),
+    }
+}
+
+/// P2P 同步候选查询接口：返回按优先级排序的候选节点列表。
+async fn p2p_sync_candidates_handler(
+    State(state): State<AppState>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    match with_p2p(&state, |engine| Ok(engine.sync_candidates())) {
+        Ok(candidates) => (
+            StatusCode::OK,
+            Json(json!({
+                "ok": true,
+                "has_candidates": !candidates.is_empty(),
+                "candidate_count": candidates.len(),
+                "candidates": candidates
+            })),
+        ),
         Err((status, body)) => (status, Json(body)),
     }
 }
@@ -4727,6 +4746,80 @@ mod tests {
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body["processed"], json!(1));
         assert_eq!(body["outbound_count"], json!(1));
+    }
+
+    /// 验证同步候选接口会返回按优先级排序的候选节点。
+    #[tokio::test]
+    async fn p2p_sync_candidates_should_return_sorted_candidates() {
+        let app = build_test_app();
+        for (peer_id, address) in [
+            ("peer-a", "/ip4/127.0.0.1/tcp/7001"),
+            ("peer-b", "/ip4/127.0.0.1/tcp/7002"),
+        ] {
+            let (status, _) = send_json(
+                &app,
+                Method::POST,
+                "/p2p/peer/register",
+                json!({
+                    "peer_id": peer_id,
+                    "address": address
+                }),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK);
+        }
+
+        let (status, _) = send_json(
+            &app,
+            Method::POST,
+            "/p2p/message",
+            json!({
+                "peer_id": "peer-a",
+                "address": "/ip4/127.0.0.1/tcp/7001",
+                "sequence": 1,
+                "message": {
+                    "ChainStatus": {
+                        "chain_id": "rustchain-lab-dev",
+                        "best_height": 12,
+                        "best_hash": "0x12",
+                        "difficulty": 2,
+                        "genesis_hash": Block::genesis().hash
+                    }
+                }
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+
+        let (status, _) = send_json(
+            &app,
+            Method::POST,
+            "/p2p/message",
+            json!({
+                "peer_id": "peer-b",
+                "address": "/ip4/127.0.0.1/tcp/7002",
+                "sequence": 1,
+                "message": {
+                    "ChainStatus": {
+                        "chain_id": "rustchain-lab-dev",
+                        "best_height": 9,
+                        "best_hash": "0x9",
+                        "difficulty": 2,
+                        "genesis_hash": Block::genesis().hash
+                    }
+                }
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+
+        let (status, body) = send_empty(&app, Method::GET, "/p2p/sync-candidates").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["ok"], json!(true));
+        assert_eq!(body["has_candidates"], json!(true));
+        assert_eq!(body["candidate_count"], json!(2));
+        assert_eq!(body["candidates"][0]["id"], json!("peer-a"));
+        assert_eq!(body["candidates"][1]["id"], json!("peer-b"));
     }
 
     /// 验证同步目标接口会返回最优候选节点。
