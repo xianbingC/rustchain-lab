@@ -550,7 +550,7 @@ fn handle_chain_command(config: &AppConfig, args: &[String]) -> AppResult<()> {
 fn handle_p2p_command(config: &AppConfig, args: &[String]) -> AppResult<()> {
     if args.len() < 2 {
         return Err(AppError::Command(
-            "p2p 命令缺少子命令，可用: status/peers/sync-candidates/sync-target/sync-gap/sync-plan/sync-step/nearest-peers/dht-buckets/bootstrap/discover/diagnose/register-peer/ping/get-chain-status/find-node/chain-status/get-blocks/get-mempool"
+            "p2p 命令缺少子命令，可用: status/peers/transport-sessions/transport-frame/sync-candidates/sync-target/sync-gap/sync-plan/sync-step/nearest-peers/dht-buckets/bootstrap/discover/diagnose/register-peer/ping/get-chain-status/find-node/chain-status/get-blocks/get-mempool"
                 .to_string(),
         ));
     }
@@ -563,6 +563,32 @@ fn handle_p2p_command(config: &AppConfig, args: &[String]) -> AppResult<()> {
         "peers" => {
             let response = call_api_json(config, Method::GET, "/p2p/peers", None)?;
             print_json("p2p_peers", response)
+        }
+        "transport-sessions" => {
+            let response = call_api_json(config, Method::GET, "/p2p/transport/sessions", None)?;
+            print_json("p2p_transport_sessions", response)
+        }
+        "transport-frame" => {
+            let peer_id = require_arg(args, 2, "peer_id")?;
+            let address = require_arg(args, 3, "address")?;
+            let frame_hex = require_arg(args, 4, "frame_hex")?;
+            let bytes = hex::decode(frame_hex.trim_start_matches("0x"))
+                .map_err(|error| AppError::Command(format!("frame_hex 解析失败: {error}")))?;
+            if bytes.is_empty() {
+                return Err(AppError::Command("frame_hex 不能为空".to_string()));
+            }
+
+            let response = call_api_json(
+                config,
+                Method::POST,
+                "/p2p/transport/frame",
+                Some(json!({
+                    "peer_id": peer_id,
+                    "address": address,
+                    "bytes": bytes
+                })),
+            )?;
+            print_json("p2p_transport_frame", response)
         }
         "sync-candidates" => {
             let response = call_api_json(config, Method::GET, "/p2p/sync-candidates", None)?;
@@ -1468,6 +1494,8 @@ fn print_help() {
     println!("  rustchain-cli chain history-tx <tx_id>");
     println!("  rustchain-cli p2p status");
     println!("  rustchain-cli p2p peers");
+    println!("  rustchain-cli p2p transport-sessions");
+    println!("  rustchain-cli p2p transport-frame <peer_id> <address> <frame_hex>");
     println!("  rustchain-cli p2p sync-candidates");
     println!("  rustchain-cli p2p sync-target");
     println!("  rustchain-cli p2p sync-gap");

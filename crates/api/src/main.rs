@@ -17,6 +17,7 @@ use rustchain_p2p::{
     engine::{OutboundEnvelope, SyncEngine},
     message::{ChainStatus, NetworkMessage},
     peer::PeerStatus,
+    transport::{encode_outbound_frames, TransportSessionPool},
 };
 #[cfg(any(test, not(feature = "rocksdb-backend")))]
 use rustchain_storage::state::InMemoryStateStore;
@@ -314,6 +315,17 @@ struct P2pIncomingMessageRequest {
     message: NetworkMessage,
 }
 
+/// P2P 入站传输帧请求。
+#[derive(Debug, Deserialize)]
+struct P2pTransportFrameRequest {
+    /// 来源节点 ID。
+    peer_id: String,
+    /// 来源节点地址。
+    address: String,
+    /// 长度前缀编码后的原始帧字节，可为半包。
+    bytes: Vec<u8>,
+}
+
 /// VM 编译请求。
 #[derive(Debug, Deserialize)]
 struct VmCompileRequest {
@@ -563,6 +575,8 @@ struct AppState {
     blockchain: Arc<Mutex<Blockchain>>,
     /// P2P 同步引擎。
     p2p_engine: Arc<Mutex<SyncEngine>>,
+    /// P2P 传输会话池，用于缓存半包和维护连接内序号。
+    p2p_transport_sessions: Arc<Mutex<TransportSessionPool>>,
     /// 本地 P2P 监听地址，用于构造握手消息。
     p2p_listen_addr: String,
     /// 本地 P2P 协议版本，用于构造握手消息。
@@ -585,6 +599,7 @@ fn default_app_state() -> AppState {
     AppState {
         blockchain: Arc::new(Mutex::new(blockchain)),
         p2p_engine: Arc::new(Mutex::new(SyncEngine::new("api-test-node", chain_status))),
+        p2p_transport_sessions: Arc::new(Mutex::new(TransportSessionPool::new())),
         p2p_listen_addr: "0.0.0.0:7000".to_string(),
         p2p_protocol_version: P2P_PROTOCOL_VERSION.to_string(),
         state_store: Arc::new(InMemoryStateStore::new()),
@@ -615,6 +630,7 @@ fn default_app_state_with_config(config: &AppConfig) -> AppResult<AppState> {
     Ok(AppState {
         blockchain: Arc::new(Mutex::new(blockchain)),
         p2p_engine: Arc::new(Mutex::new(p2p_engine)),
+        p2p_transport_sessions: Arc::new(Mutex::new(TransportSessionPool::new())),
         p2p_listen_addr: config.p2p_bind_addr.clone(),
         p2p_protocol_version: P2P_PROTOCOL_VERSION.to_string(),
         state_store,
@@ -748,6 +764,11 @@ fn build_app(shared_state: AppState) -> Router {
         .route("/p2p/diagnose", post(p2p_diagnose_handler))
         .route("/p2p/peer/register", post(p2p_register_peer_handler))
         .route("/p2p/message", post(p2p_message_handler))
+        .route(
+            "/p2p/transport/sessions",
+            get(p2p_transport_sessions_handler),
+        )
+        .route("/p2p/transport/frame", post(p2p_transport_frame_handler))
         .route("/chain/info", get(chain_info_handler))
         .route("/chain/difficulty", get(chain_difficulty_handler))
         .route("/chain/validate", get(chain_validate_handler))
@@ -1339,6 +1360,108 @@ async fn p2p_register_peer_handler(
         }
         Err((status, body)) => (status, Json(body)),
     }
+}
+
+/// P2P 传输会话快照接口。
+async fn p2p_transport_sessions_handler(
+    State(state): State<AppState>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    match with_transport_sessions(&state, |sessions| Ok(sessions.snapshot())) {
+        Ok(sessions) => (
+            StatusCode::OK,
+            Json(json!({
+                "ok": true,
+                "session_count": sessions.len(),
+                "sessions": sessions
+            })),
+        ),
+        Err((status, body)) => (status, Json(body)),
+    }
+}
+
+/// P2P 入站传输帧接口，用于模拟真实 TCP/Noise 解密后的字节流。
+async fn p2p_transport_frame_handler(
+    State(state): State<AppState>,
+    Json(payload): Json<P2pTransportFrameRequest>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    if payload.peer_id.trim().is_empty() || payload.address.trim().is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "ok": false,
+                "error": "peer_id 和 address 不能为空"
+            })),
+        );
+    }
+    if payload.bytes.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "ok": false,
+                "error": "bytes 不能为空"
+            })),
+        );
+    }
+
+    let peer_id = payload.peer_id.trim().to_string();
+    let address = payload.address.trim().to_string();
+    let bytes_received = payload.bytes.len();
+
+    let mut engine = match state.p2p_engine.lock() {
+        Ok(engine) => engine,
+        Err(_) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({
+                    "ok": false,
+                    "error": "p2p_engine 锁异常"
+                })),
+            )
+        }
+    };
+    let mut sessions = match state.p2p_transport_sessions.lock() {
+        Ok(sessions) => sessions,
+        Err(_) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({
+                    "ok": false,
+                    "error": "p2p_transport_sessions 锁异常"
+                })),
+            )
+        }
+    };
+
+    let report = match sessions.push_inbound_bytes(&mut engine, peer_id, address, &payload.bytes) {
+        Ok(report) => report,
+        Err(error) => {
+            let (status, body) = map_p2p_error(error);
+            return (status, Json(body));
+        }
+    };
+    let outbound_frames = match encode_outbound_frames(&report.outbound) {
+        Ok(frames) => frames,
+        Err(error) => {
+            let (status, body) = map_p2p_error(error);
+            return (status, Json(body));
+        }
+    };
+    let session_snapshot = sessions.snapshot();
+
+    (
+        StatusCode::OK,
+        Json(json!({
+            "ok": true,
+            "bytes_received": bytes_received,
+            "processed": report.processed,
+            "outbound_count": report.outbound.len(),
+            "outbound": report.outbound,
+            "outbound_frame_count": outbound_frames.len(),
+            "outbound_frames": outbound_frames,
+            "session_count": session_snapshot.len(),
+            "sessions": session_snapshot
+        })),
+    )
 }
 
 /// P2P 入站消息模拟接口。
@@ -3281,6 +3404,24 @@ fn with_p2p_mut<T>(
     f(&mut guard).map_err(map_p2p_error)
 }
 
+/// 只读访问 P2P 传输会话池。
+fn with_transport_sessions<T>(
+    state: &AppState,
+    f: impl FnOnce(&TransportSessionPool) -> Result<T, rustchain_p2p::P2pError>,
+) -> Result<T, (StatusCode, serde_json::Value)> {
+    let guard = state.p2p_transport_sessions.lock().map_err(|_| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            json!({
+                "ok": false,
+                "error": "p2p_transport_sessions 锁异常"
+            }),
+        )
+    })?;
+
+    f(&guard).map_err(map_p2p_error)
+}
+
 /// 只读访问借贷池。
 fn with_pool<T>(
     state: &AppState,
@@ -3630,6 +3771,7 @@ mod tests {
     use rustchain_core::blockchain::Blockchain;
     use rustchain_core::transaction::{Transaction, TransactionKind};
     use rustchain_crypto::wallet::create_wallet;
+    use rustchain_p2p::{codec::FramedMessageCodec, message::NetworkMessage};
     use serde_json::{json, Value};
     use tower::ServiceExt;
 
@@ -4746,6 +4888,82 @@ mod tests {
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body["processed"], json!(1));
         assert_eq!(body["outbound_count"], json!(1));
+    }
+
+    /// 验证长度前缀传输帧可通过 API 进入 P2P 引擎并返回出站帧。
+    #[tokio::test]
+    async fn p2p_transport_frame_should_process_complete_frame() {
+        let app = build_test_app();
+        let frame = FramedMessageCodec::encode_frame(&NetworkMessage::Ping {
+            nonce: 17,
+            timestamp: 88,
+        })
+        .expect("传输帧编码应成功");
+
+        let (status, body) = send_json(
+            &app,
+            Method::POST,
+            "/p2p/transport/frame",
+            json!({
+                "peer_id": "peer-a",
+                "address": "/ip4/127.0.0.1/tcp/7001",
+                "bytes": frame
+            }),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["ok"], json!(true));
+        assert_eq!(body["processed"], json!(1));
+        assert_eq!(body["outbound_count"], json!(1));
+        assert_eq!(body["outbound_frame_count"], json!(1));
+        assert_eq!(body["session_count"], json!(1));
+        assert_eq!(body["sessions"][0]["peer_id"], json!("peer-a"));
+        assert_eq!(body["sessions"][0]["next_sequence"], json!(2));
+    }
+
+    /// 验证传输帧半包会被缓存，并在补齐后完成处理。
+    #[tokio::test]
+    async fn p2p_transport_frame_should_cache_partial_frame() {
+        let app = build_test_app();
+        let frame = FramedMessageCodec::encode_frame(&NetworkMessage::GetChainStatus)
+            .expect("传输帧编码应成功");
+        let split_at = frame.len() / 2;
+
+        let (status, body) = send_json(
+            &app,
+            Method::POST,
+            "/p2p/transport/frame",
+            json!({
+                "peer_id": "peer-a",
+                "address": "/ip4/127.0.0.1/tcp/7001",
+                "bytes": &frame[..split_at]
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["processed"], json!(0));
+        assert_eq!(body["sessions"][0]["buffered_bytes"], json!(split_at));
+
+        let (status, body) = send_json(
+            &app,
+            Method::POST,
+            "/p2p/transport/frame",
+            json!({
+                "peer_id": "peer-a",
+                "address": "/ip4/127.0.0.1/tcp/7001",
+                "bytes": &frame[split_at..]
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["processed"], json!(1));
+        assert_eq!(body["sessions"][0]["buffered_bytes"], json!(0));
+
+        let (status, body) = send_empty(&app, Method::GET, "/p2p/transport/sessions").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["session_count"], json!(1));
+        assert_eq!(body["sessions"][0]["next_sequence"], json!(2));
     }
 
     /// 验证同步候选接口会返回按优先级排序的候选节点。
