@@ -6,5 +6,6 @@ pub mod error;
 pub mod message;
 pub mod peer;
 pub mod queue;
+pub mod transport;
 
 pub use error::{P2pError, P2pResult};
