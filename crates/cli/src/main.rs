@@ -6,6 +6,7 @@ use rustchain_crypto::wallet::{
     backup_wallet_to_file, create_wallet, create_wallet_from_private_key, restore_wallet_from_file,
     Wallet, WalletKeyPair,
 };
+use rustchain_p2p::{codec::FramedMessageCodec, message::NetworkMessage};
 use serde_json::{json, Value};
 use std::{
     fs,
@@ -550,7 +551,7 @@ fn handle_chain_command(config: &AppConfig, args: &[String]) -> AppResult<()> {
 fn handle_p2p_command(config: &AppConfig, args: &[String]) -> AppResult<()> {
     if args.len() < 2 {
         return Err(AppError::Command(
-            "p2p 命令缺少子命令，可用: status/peers/transport-sessions/transport-frame/sync-candidates/sync-target/sync-gap/sync-plan/sync-step/nearest-peers/dht-buckets/bootstrap/discover/diagnose/register-peer/ping/get-chain-status/find-node/chain-status/get-blocks/get-mempool"
+            "p2p 命令缺少子命令，可用: status/peers/transport-sessions/transport-frame/transport-ping/sync-candidates/sync-target/sync-gap/sync-plan/sync-step/nearest-peers/dht-buckets/bootstrap/discover/diagnose/register-peer/ping/get-chain-status/find-node/chain-status/get-blocks/get-mempool"
                 .to_string(),
         ));
     }
@@ -589,6 +590,35 @@ fn handle_p2p_command(config: &AppConfig, args: &[String]) -> AppResult<()> {
                 })),
             )?;
             print_json("p2p_transport_frame", response)
+        }
+        "transport-ping" => {
+            let peer_id = require_arg(args, 2, "peer_id")?;
+            let address = require_arg(args, 3, "address")?;
+            let timestamp = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|duration| duration.as_secs() as i64)
+                .unwrap_or(0);
+            let nonce = args
+                .get(4)
+                .map(|raw| {
+                    raw.parse::<u64>()
+                        .map_err(|error| AppError::Command(format!("nonce 参数解析失败: {error}")))
+                })
+                .transpose()?
+                .unwrap_or(timestamp as u64);
+            let bytes = build_transport_ping_frame(nonce, timestamp)?;
+            let mut response = call_api_json(
+                config,
+                Method::POST,
+                "/p2p/transport/frame",
+                Some(json!({
+                    "peer_id": peer_id,
+                    "address": address,
+                    "bytes": bytes
+                })),
+            )?;
+            response["frame_hex"] = json!(hex::encode(&bytes));
+            print_json("p2p_transport_ping", response)
         }
         "sync-candidates" => {
             let response = call_api_json(config, Method::GET, "/p2p/sync-candidates", None)?;
@@ -1446,6 +1476,12 @@ fn build_signed_contract_call_tx(
     Ok(tx)
 }
 
+/// 构造长度前缀编码的 P2P Ping 传输帧。
+fn build_transport_ping_frame(nonce: u64, timestamp: i64) -> AppResult<Vec<u8>> {
+    FramedMessageCodec::encode_frame(&NetworkMessage::Ping { nonce, timestamp })
+        .map_err(|error| AppError::Command(format!("构造 P2P 传输帧失败: {error}")))
+}
+
 /// 从文件读取合约源码文本。
 fn read_contract_source(path: &str) -> AppResult<String> {
     let source = fs::read_to_string(path)
@@ -1496,6 +1532,7 @@ fn print_help() {
     println!("  rustchain-cli p2p peers");
     println!("  rustchain-cli p2p transport-sessions");
     println!("  rustchain-cli p2p transport-frame <peer_id> <address> <frame_hex>");
+    println!("  rustchain-cli p2p transport-ping <peer_id> <address> [nonce]");
     println!("  rustchain-cli p2p sync-candidates");
     println!("  rustchain-cli p2p sync-target");
     println!("  rustchain-cli p2p sync-gap");
@@ -1541,11 +1578,12 @@ fn print_help() {
 mod tests {
     use super::{
         api_base_url, build_signed_contract_call_tx, build_signed_transfer_tx,
-        compute_head_from_height, parse_address_txs_args, parse_chain_height, parse_mempool_args,
-        read_contract_source, require_arg,
+        build_transport_ping_frame, compute_head_from_height, parse_address_txs_args,
+        parse_chain_height, parse_mempool_args, read_contract_source, require_arg,
     };
     use rustchain_common::AppConfig;
     use rustchain_crypto::wallet::create_wallet;
+    use rustchain_p2p::{codec::FramedMessageCodec, message::NetworkMessage};
     use serde_json::json;
     use std::{fs, path::PathBuf};
 
@@ -1680,6 +1718,23 @@ mod tests {
         });
         let height = parse_chain_height(&chain_info).expect("解析高度应成功");
         assert_eq!(height, 18);
+    }
+
+    /// 验证 CLI 可以构造真实 P2P 传输 Ping 帧。
+    #[test]
+    fn build_transport_ping_frame_should_encode_network_message() {
+        let frame = build_transport_ping_frame(9, 123).expect("Ping 帧构造应成功");
+        let decoded = FramedMessageCodec::decode_frame(&frame)
+            .expect("帧解码应成功")
+            .expect("应得到完整帧");
+
+        assert_eq!(
+            decoded.message,
+            NetworkMessage::Ping {
+                nonce: 9,
+                timestamp: 123
+            }
+        );
     }
 
     /// 验证交易池命令参数解析支持 limit/address 组合。
