@@ -15,6 +15,19 @@ pub struct OutboundFrame {
     pub bytes: Vec<u8>,
 }
 
+/// 传输会话诊断快照，供 API、CLI 或日志层展示。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TransportSessionSnapshot {
+    /// 远端节点 ID。
+    pub peer_id: String,
+    /// 远端连接地址。
+    pub address: String,
+    /// 下一条入站消息序号。
+    pub next_sequence: u64,
+    /// 当前缓存的未完成字节数。
+    pub buffered_bytes: usize,
+}
+
 /// 单个远端连接的传输会话，负责把字节流转换成顺序消息。
 #[derive(Debug, Clone)]
 pub struct TransportSession {
@@ -43,6 +56,16 @@ impl TransportSession {
     /// 返回当前缓存的未完成字节数，用于排查半包堆积问题。
     pub fn buffered_len(&self) -> usize {
         self.decode_buffer.buffered_len()
+    }
+
+    /// 生成当前会话的只读诊断快照。
+    pub fn snapshot(&self) -> TransportSessionSnapshot {
+        TransportSessionSnapshot {
+            peer_id: self.peer_id.clone(),
+            address: self.address.clone(),
+            next_sequence: self.next_sequence,
+            buffered_bytes: self.buffered_len(),
+        }
     }
 
     /// 追加网络字节并处理所有已完整的消息帧。
@@ -122,6 +145,17 @@ impl TransportSessionPool {
         self.sessions
             .get(peer_id)
             .map(TransportSession::buffered_len)
+    }
+
+    /// 返回所有会话的稳定排序快照，便于接口输出和测试断言。
+    pub fn snapshot(&self) -> Vec<TransportSessionSnapshot> {
+        let mut snapshots = self
+            .sessions
+            .values()
+            .map(TransportSession::snapshot)
+            .collect::<Vec<_>>();
+        snapshots.sort_by(|left, right| left.peer_id.cmp(&right.peer_id));
+        snapshots
     }
 }
 
@@ -311,5 +345,31 @@ mod tests {
         assert_eq!(pool.session_count(), 0);
         assert_eq!(pool.next_sequence("peer-a"), None);
         assert!(!pool.remove("peer-a"));
+    }
+
+    /// 验证会话池快照会按 peer_id 排序，便于 API 输出稳定可读。
+    #[test]
+    fn transport_session_pool_snapshot_should_be_sorted() {
+        let mut engine = SyncEngine::new("local-node", local_status(3));
+        let mut pool = TransportSessionPool::new();
+        let frame = FramedMessageCodec::encode_frame(&NetworkMessage::GetMempool)
+            .expect("完整帧编码应成功");
+        let partial = &frame[..frame.len() / 2];
+
+        pool.push_inbound_bytes(&mut engine, "peer-b", "/ip4/127.0.0.1/tcp/7002", &frame)
+            .expect("peer-b 完整帧应处理成功");
+        pool.push_inbound_bytes(&mut engine, "peer-a", "/ip4/127.0.0.1/tcp/7001", partial)
+            .expect("peer-a 半包应缓存成功");
+
+        let snapshot = pool.snapshot();
+
+        assert_eq!(snapshot.len(), 2);
+        assert_eq!(snapshot[0].peer_id, "peer-a");
+        assert_eq!(snapshot[0].address, "/ip4/127.0.0.1/tcp/7001");
+        assert_eq!(snapshot[0].next_sequence, 1);
+        assert_eq!(snapshot[0].buffered_bytes, partial.len());
+        assert_eq!(snapshot[1].peer_id, "peer-b");
+        assert_eq!(snapshot[1].next_sequence, 2);
+        assert_eq!(snapshot[1].buffered_bytes, 0);
     }
 }
