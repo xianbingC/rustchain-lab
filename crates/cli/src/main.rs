@@ -983,6 +983,10 @@ fn handle_vm_command(config: &AppConfig, args: &[String]) -> AppResult<()> {
 }
 
 /// 处理 DeFi 相关命令（通过 API 调用）。
+/// 处理 DeFi 相关命令（通过 API 调用）。
+///
+/// 写操作需要提供签名密钥，因为 DeFi 动作以链上交易形式提交，
+/// 需等待 `chain mine` 出块后才生效。
 fn handle_defi_command(config: &AppConfig, args: &[String]) -> AppResult<()> {
     if args.len() < 2 {
         return Err(AppError::Command(
@@ -995,55 +999,90 @@ fn handle_defi_command(config: &AppConfig, args: &[String]) -> AppResult<()> {
         "deposit" => {
             let owner = require_arg(args, 2, "owner")?;
             let amount = parse_u64_arg(args, 3, "amount")?;
+            let private_key = require_arg(args, 4, "private_key")?;
+            let public_key = require_arg(args, 5, "public_key")?;
             let response = call_api_json(
                 config,
                 Method::POST,
                 "/defi/deposit",
-                Some(json!({ "owner": owner, "amount": amount })),
+                Some(json!({
+                    "owner": owner,
+                    "amount": amount,
+                    "private_key": private_key,
+                    "public_key": public_key
+                })),
             )?;
             print_json("defi_deposit", response)
         }
         "borrow" => {
             let owner = require_arg(args, 2, "owner")?;
             let amount = parse_u64_arg(args, 3, "amount")?;
+            let private_key = require_arg(args, 4, "private_key")?;
+            let public_key = require_arg(args, 5, "public_key")?;
             let response = call_api_json(
                 config,
                 Method::POST,
                 "/defi/borrow",
-                Some(json!({ "owner": owner, "amount": amount })),
+                Some(json!({
+                    "owner": owner,
+                    "amount": amount,
+                    "private_key": private_key,
+                    "public_key": public_key
+                })),
             )?;
             print_json("defi_borrow", response)
         }
         "repay" => {
             let owner = require_arg(args, 2, "owner")?;
             let amount = parse_u64_arg(args, 3, "amount")?;
+            let private_key = require_arg(args, 4, "private_key")?;
+            let public_key = require_arg(args, 5, "public_key")?;
             let response = call_api_json(
                 config,
                 Method::POST,
                 "/defi/repay",
-                Some(json!({ "owner": owner, "amount": amount })),
+                Some(json!({
+                    "owner": owner,
+                    "amount": amount,
+                    "private_key": private_key,
+                    "public_key": public_key
+                })),
             )?;
             print_json("defi_repay", response)
         }
         "withdraw" => {
             let owner = require_arg(args, 2, "owner")?;
             let amount = parse_u64_arg(args, 3, "amount")?;
+            let private_key = require_arg(args, 4, "private_key")?;
+            let public_key = require_arg(args, 5, "public_key")?;
             let response = call_api_json(
                 config,
                 Method::POST,
                 "/defi/withdraw",
-                Some(json!({ "owner": owner, "amount": amount })),
+                Some(json!({
+                    "owner": owner,
+                    "amount": amount,
+                    "private_key": private_key,
+                    "public_key": public_key
+                })),
             )?;
             print_json("defi_withdraw", response)
         }
         "liquidate" => {
             let borrower = require_arg(args, 2, "borrower")?;
             let amount = parse_u64_arg(args, 3, "amount")?;
+            let private_key = require_arg(args, 4, "private_key")?;
+            let public_key = require_arg(args, 5, "public_key")?;
             let response = call_api_json(
                 config,
                 Method::POST,
                 "/defi/liquidate",
-                Some(json!({ "borrower": borrower, "amount": amount })),
+                Some(json!({
+                    "borrower": borrower,
+                    "amount": amount,
+                    "private_key": private_key,
+                    "public_key": public_key
+                })),
             )?;
             print_json("defi_liquidate", response)
         }
@@ -1556,11 +1595,12 @@ fn print_help() {
     println!("  rustchain-cli p2p get-blocks <peer_id> <address> <sequence> <from_height> [limit]");
     println!("  rustchain-cli vm compile-file <source_path>");
     println!("  rustchain-cli vm execute-file <source_path> [max_steps]");
-    println!("  rustchain-cli defi deposit <owner> <amount>");
-    println!("  rustchain-cli defi borrow <owner> <amount>");
-    println!("  rustchain-cli defi repay <owner> <amount>");
-    println!("  rustchain-cli defi withdraw <owner> <amount>");
-    println!("  rustchain-cli defi liquidate <borrower> <amount>");
+    println!("  # DeFi 写操作提交链上交易，需签名密钥并调用 chain mine 出块后生效");
+    println!("  rustchain-cli defi deposit <owner> <amount> <private_key> <public_key>");
+    println!("  rustchain-cli defi borrow <owner> <amount> <private_key> <public_key>");
+    println!("  rustchain-cli defi repay <owner> <amount> <private_key> <public_key>");
+    println!("  rustchain-cli defi withdraw <owner> <amount> <private_key> <public_key>");
+    println!("  rustchain-cli defi liquidate <borrower> <amount> <private_key> <public_key>");
     println!("  rustchain-cli defi position <owner>");
     println!("  rustchain-cli defi stats");
     println!("  rustchain-cli nft mint <owner> <name> <description> <image_url>");

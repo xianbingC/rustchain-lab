@@ -2178,51 +2178,123 @@ async fn p2p_blocks_should_request_next_batch_when_still_behind() {
 #[tokio::test]
 async fn defi_flow_should_work() {
     let app = build_test_app();
+    let (wallet, key_pair) = create_wallet("defi-api-pass").expect("创建钱包应当成功");
 
-    let (status, _) = send_json(
+    // 1. 抵押：提交交易后仅入池，仓位尚未生效。
+    let (status, body) = send_json(
         &app,
         Method::POST,
         "/defi/deposit",
         json!({
-            "owner": "alice",
-            "amount": 200
-        }),
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK);
-
-    let (status, body) = send_json(
-        &app,
-        Method::POST,
-        "/defi/borrow",
-        json!({
-            "owner": "alice",
-            "amount": 100
+            "owner": wallet.address,
+            "amount": 200,
+            "private_key": key_pair.private_key,
+            "public_key": key_pair.public_key
         }),
     )
     .await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["ok"], json!(true));
+    assert_eq!(body["action"], json!("deposit_collateral"));
+    assert_eq!(body["pending_tx_count"], json!(1));
+
+    // 出块前仓位不存在，证明状态确实由链推进。
+    let (status, body) = send_empty(
+        &app,
+        Method::GET,
+        &format!("/defi/position/{}", wallet.address),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(body["ok"], json!(false));
+
+    // 2. 出块确认后仓位才生效。
+    let (status, _) = send_json(
+        &app,
+        Method::POST,
+        "/chain/mine",
+        json!({ "miner_address": "miner-defi" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let (status, body) = send_empty(
+        &app,
+        Method::GET,
+        &format!("/defi/position/{}", wallet.address),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["position"]["collateral_amount"], json!(200));
+    assert_eq!(body["position"]["debt_amount"], json!(0));
+
+    // 3. 借款并出块。
+    let (status, body) = send_json(
+        &app,
+        Method::POST,
+        "/defi/borrow",
+        json!({
+            "owner": wallet.address,
+            "amount": 100,
+            "private_key": key_pair.private_key,
+            "public_key": key_pair.public_key
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["ok"], json!(true));
+
+    let (status, _) = send_json(
+        &app,
+        Method::POST,
+        "/chain/mine",
+        json!({ "miner_address": "miner-defi" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let (status, body) = send_empty(
+        &app,
+        Method::GET,
+        &format!("/defi/position/{}", wallet.address),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
     assert_eq!(body["position"]["debt_amount"], json!(100));
 
-    let (status, body) = send_json(
+    // 4. 提取抵押并出块。
+    let (status, _) = send_json(
         &app,
         Method::POST,
         "/defi/withdraw",
         json!({
-            "owner": "alice",
-            "amount": 10
+            "owner": wallet.address,
+            "amount": 10,
+            "private_key": key_pair.private_key,
+            "public_key": key_pair.public_key
         }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, _) = send_json(
+        &app,
+        Method::POST,
+        "/chain/mine",
+        json!({ "miner_address": "miner-defi" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let (status, body) = send_empty(
+        &app,
+        Method::GET,
+        &format!("/defi/position/{}", wallet.address),
     )
     .await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["position"]["collateral_amount"], json!(190));
 
-    let (status, body) = send_empty(&app, Method::GET, "/defi/position/alice").await;
-    assert_eq!(status, StatusCode::OK);
-    assert_eq!(body["position"]["owner"], json!("alice"));
-    assert_eq!(body["position"]["collateral_amount"], json!(190));
-
+    // 5. 池统计随链上状态更新。
     let (status, body) = send_empty(&app, Method::GET, "/defi/stats").await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["stats"]["position_count"], json!(1));
@@ -2230,19 +2302,70 @@ async fn defi_flow_should_work() {
     assert_eq!(body["stats"]["total_debt"], json!(100));
 }
 
+/// 验证查询不存在的 DeFi 仓位返回 404。
+#[tokio::test]
+async fn defi_missing_position_should_return_not_found() {
+    let app = build_test_app();
+
+    let (status, body) = send_empty(&app, Method::GET, "/defi/position/nobody").await;
+
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(body["ok"], json!(false));
+    assert!(
+        body["error"]
+            .as_str()
+            .expect("error 应为字符串")
+            .contains("仓位不存在"),
+        "错误信息应说明仓位不存在，实际: {}",
+        body["error"]
+    );
+}
+
+/// 验证 DeFi 写操作缺少签名密钥时会被拒绝。
+#[tokio::test]
+async fn defi_action_without_keys_should_fail() {
+    let app = build_test_app();
+
+    let (status, body) = send_json(
+        &app,
+        Method::POST,
+        "/defi/deposit",
+        json!({
+            "owner": "alice",
+            "amount": 200,
+            "private_key": "",
+            "public_key": ""
+        }),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(body["ok"], json!(false));
+}
+
 /// 验证健康仓位清算会被拒绝。
 #[tokio::test]
 async fn defi_healthy_position_should_not_liquidate() {
     let app = build_test_app();
+    let (wallet, key_pair) = create_wallet("defi-api-pass").expect("创建钱包应当成功");
 
     let _ = send_json(
         &app,
         Method::POST,
         "/defi/deposit",
         json!({
-            "owner": "alice",
-            "amount": 200
+            "owner": wallet.address,
+            "amount": 200,
+            "private_key": key_pair.private_key,
+            "public_key": key_pair.public_key
         }),
+    )
+    .await;
+    let _ = send_json(
+        &app,
+        Method::POST,
+        "/chain/mine",
+        json!({ "miner_address": "miner-defi" }),
     )
     .await;
     let _ = send_json(
@@ -2250,19 +2373,31 @@ async fn defi_healthy_position_should_not_liquidate() {
         Method::POST,
         "/defi/borrow",
         json!({
-            "owner": "alice",
-            "amount": 100
+            "owner": wallet.address,
+            "amount": 100,
+            "private_key": key_pair.private_key,
+            "public_key": key_pair.public_key
         }),
     )
     .await;
+    let _ = send_json(
+        &app,
+        Method::POST,
+        "/chain/mine",
+        json!({ "miner_address": "miner-defi" }),
+    )
+    .await;
 
+    // 仓位健康（抵押率 200%），清算应在入池阶段就被拒绝。
     let (status, body) = send_json(
         &app,
         Method::POST,
         "/defi/liquidate",
         json!({
-            "borrower": "alice",
-            "amount": 20
+            "borrower": wallet.address,
+            "amount": 20,
+            "private_key": key_pair.private_key,
+            "public_key": key_pair.public_key
         }),
     )
     .await;

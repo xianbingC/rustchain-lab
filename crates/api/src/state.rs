@@ -4,10 +4,8 @@
 //! `with_*` 访问器，把"取锁 + 错误映射"的重复逻辑收敛到一处。
 
 use crate::error::{
-    lock_error, map_core_error, map_defi_error, map_nft_error, map_p2p_error, map_storage_error,
-    ApiError,
+    lock_error, map_core_error, map_nft_error, map_p2p_error, map_storage_error, ApiError,
 };
-use rustchain_apps::defi::{DefiError, LendingConfig, LendingPool};
 use rustchain_apps::nft::{NftError, NftMarketplace};
 use rustchain_common::{AppConfig, AppResult};
 use rustchain_core::block::Block;
@@ -24,7 +22,6 @@ use rustchain_storage::{
 use std::{
     path::PathBuf,
     sync::{Arc, Mutex},
-    time::{SystemTime, UNIX_EPOCH},
 };
 
 /// P2P 协议版本号（原型阶段固定）。
@@ -47,8 +44,6 @@ pub(crate) struct AppState {
     pub(crate) state_store: Arc<dyn StateStore + Send + Sync>,
     /// 历史数据存储。
     pub(crate) history_store: Arc<dyn HistoryStore + Send + Sync>,
-    /// DeFi 借贷池（原型阶段使用内存存储）。
-    pub(crate) lending_pool: Arc<Mutex<LendingPool>>,
     /// NFT 市场（原型阶段使用内存存储）。
     pub(crate) nft_marketplace: Arc<Mutex<NftMarketplace>>,
 }
@@ -66,10 +61,6 @@ pub(crate) fn default_app_state() -> AppState {
         p2p_protocol_version: P2P_PROTOCOL_VERSION.to_string(),
         state_store: Arc::new(InMemoryStateStore::new()),
         history_store: Arc::new(rustchain_storage::history::InMemoryHistoryStore::new()),
-        lending_pool: Arc::new(Mutex::new(LendingPool::new(
-            LendingConfig::default(),
-            now_unix_ts(),
-        ))),
         nft_marketplace: Arc::new(Mutex::new(NftMarketplace::new())),
     }
 }
@@ -97,10 +88,6 @@ pub(crate) fn default_app_state_with_config(config: &AppConfig) -> AppResult<App
         p2p_protocol_version: P2P_PROTOCOL_VERSION.to_string(),
         state_store,
         history_store,
-        lending_pool: Arc::new(Mutex::new(LendingPool::new(
-            LendingConfig::default(),
-            now_unix_ts(),
-        ))),
         nft_marketplace: Arc::new(Mutex::new(NftMarketplace::new())),
     })
 }
@@ -198,14 +185,6 @@ pub(crate) fn parse_seed_node_entry(raw: &str, index: usize) -> Option<(String, 
     Some((format!("seed-{}", index + 1), value.to_string()))
 }
 
-/// 返回当前时间戳（秒）。
-pub(crate) fn now_unix_ts() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_secs() as i64)
-        .unwrap_or(0)
-}
-
 /// 只读访问区块链状态。
 pub(crate) fn with_chain<T>(
     state: &AppState,
@@ -269,32 +248,6 @@ pub(crate) fn with_transport_sessions<T>(
         .map_err(|_| lock_error("p2p_transport_sessions"))?;
 
     f(&guard).map_err(map_p2p_error)
-}
-
-/// 只读访问借贷池。
-pub(crate) fn with_pool<T>(
-    state: &AppState,
-    f: impl FnOnce(&LendingPool) -> Result<T, DefiError>,
-) -> Result<T, ApiError> {
-    let guard = state
-        .lending_pool
-        .lock()
-        .map_err(|_| lock_error("lending_pool"))?;
-
-    f(&guard).map_err(map_defi_error)
-}
-
-/// 可变访问借贷池。
-pub(crate) fn with_pool_mut<T>(
-    state: &AppState,
-    f: impl FnOnce(&mut LendingPool) -> Result<T, DefiError>,
-) -> Result<T, ApiError> {
-    let mut guard = state
-        .lending_pool
-        .lock()
-        .map_err(|_| lock_error("lending_pool"))?;
-
-    f(&mut guard).map_err(map_defi_error)
 }
 
 /// 只读访问 NFT 市场。

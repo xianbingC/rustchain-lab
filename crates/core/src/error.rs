@@ -77,4 +77,19 @@ pub enum CoreError {
     /// 合约执行失败。
     #[error("合约执行失败: tx_id={tx_id}, reason={reason}")]
     ContractExecutionFailed { tx_id: String, reason: String },
+    /// DeFi 载荷编解码或校验失败。
+    #[error("DeFi 载荷非法: tx_id={tx_id}, reason={reason}")]
+    DefiPayloadInvalid { tx_id: String, reason: String },
+    /// DeFi 业务执行失败（抵押率不足、仓位不存在等）。
+    #[error("DeFi 执行失败: tx_id={tx_id}, reason={reason}")]
+    DefiExecutionFailed { tx_id: String, reason: String },
+    /// DeFi 动作的主体地址与交易发送方不一致。
+    #[error("DeFi 载荷 owner 必须等于交易发送方: owner={owner}, sender={sender}")]
+    DefiOwnerMismatch { owner: String, sender: String },
+    /// 查询的 DeFi 仓位不存在。
+    ///
+    /// 单独成变体（而非塞进 `DefiExecutionFailed` 的字符串）是为了让接口层
+    /// 能把"不存在"映射为 404，而不是笼统的 400。
+    #[error("DeFi 仓位不存在: owner={owner}")]
+    DefiPositionNotFound { owner: String },
 }

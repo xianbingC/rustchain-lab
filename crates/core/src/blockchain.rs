@@ -1,9 +1,11 @@
 use crate::{
     block::Block,
+    defi_payload::{DefiAction, DefiPayload},
     error::CoreError,
     transaction::{Transaction, TransactionKind},
     CoreResult,
 };
+use rustchain_apps::defi::{LendingConfig, LendingPool};
 use rustchain_vm::{compiler::compile, runtime::Runtime};
 use std::collections::HashMap;
 
@@ -35,6 +37,8 @@ pub struct Blockchain {
     pub contract_states: HashMap<String, HashMap<String, i64>>,
     /// 合约事件日志，key 为合约地址。
     pub contract_events: HashMap<String, Vec<String>>,
+    /// DeFi 借贷池状态，随区块确认推进。
+    pub lending_pool: LendingPool,
 }
 
 impl Default for Blockchain {
@@ -46,6 +50,15 @@ impl Default for Blockchain {
 impl Blockchain {
     /// 初始化新区块链，并自动创建创世区块。
     pub fn new(difficulty: u32, mining_reward: u64) -> Self {
+        Self::new_with_defi_config(difficulty, mining_reward, LendingConfig::default())
+    }
+
+    /// 使用自定义 DeFi 借贷参数初始化新区块链。
+    pub fn new_with_defi_config(
+        difficulty: u32,
+        mining_reward: u64,
+        defi_config: LendingConfig,
+    ) -> Self {
         Self {
             chain_id: "rustchain-lab-dev".to_string(),
             chain: vec![Block::genesis()],
@@ -58,6 +71,8 @@ impl Blockchain {
             difficulty_adjustment_interval: DEFAULT_DIFFICULTY_ADJUSTMENT_INTERVAL,
             contract_states: HashMap::new(),
             contract_events: HashMap::new(),
+            // 借贷池以创世时间起点初始化，链上计息从区块时间戳推进。
+            lending_pool: LendingPool::new(defi_config, 0),
         }
     }
 
@@ -136,7 +151,7 @@ impl Blockchain {
         candidate_block.mine(expected_difficulty);
 
         self.validate_next_block(&candidate_block)?;
-        self.apply_contract_state_transitions(&candidate_block.transactions)?;
+        self.apply_state_transitions(&candidate_block.transactions)?;
         self.chain.push(candidate_block.clone());
         self.pending_transactions.clear();
         self.refresh_next_difficulty_cache();
@@ -147,7 +162,7 @@ impl Blockchain {
     /// 接收外部同步区块并追加到当前主链。
     pub fn append_external_block(&mut self, block: Block) -> CoreResult<()> {
         self.validate_next_block(&block)?;
-        self.apply_contract_state_transitions(&block.transactions)?;
+        self.apply_state_transitions(&block.transactions)?;
         self.chain.push(block.clone());
         self.refresh_next_difficulty_cache();
 
@@ -342,6 +357,9 @@ impl Blockchain {
     }
 
     /// 将单笔交易应用到余额快照中。
+    ///
+    /// DeFi 动作只操作借贷池内部账本，`amount` 表示抵押/借款数量而非转账金额，
+    /// 因此不参与账户余额的收支计算。
     fn apply_transaction_to_balances(
         &self,
         transaction: &Transaction,
@@ -349,6 +367,10 @@ impl Blockchain {
     ) -> CoreResult<()> {
         transaction.validate_for_chain()?;
         self.validate_transaction_payload(transaction)?;
+
+        if is_internal_action(transaction) {
+            return Ok(());
+        }
 
         if !transaction.is_system() {
             let available = balances.get(&transaction.from).copied().unwrap_or(0);
@@ -372,30 +394,25 @@ impl Blockchain {
         Ok(())
     }
 
-    /// 校验并执行交易中附带的合约脚本载荷。
+    /// 校验交易中附带的业务载荷（合约脚本或 DeFi 动作）。
+    ///
+    /// 入池阶段只做"试执行"校验，不落状态；真正的状态推进在出块确认后由
+    /// `apply_state_transitions` 完成。
     fn validate_transaction_payload(&self, transaction: &Transaction) -> CoreResult<()> {
-        if !is_contract_transaction(transaction) {
-            return Ok(());
+        match transaction.kind {
+            TransactionKind::ContractDeploy | TransactionKind::ContractCall => {
+                self.validate_contract_payload(transaction)
+            }
+            TransactionKind::DefiAction => self.validate_defi_payload(transaction),
+            _ => Ok(()),
         }
+    }
 
-        let Some(raw_payload) = transaction.payload.as_ref() else {
+    /// 校验合约脚本载荷（UTF-8 文本源码）。
+    fn validate_contract_payload(&self, transaction: &Transaction) -> CoreResult<()> {
+        let Some(source) = decode_contract_source(transaction)? else {
             return Ok(());
         };
-
-        if raw_payload.is_empty() {
-            return Ok(());
-        }
-
-        let source = std::str::from_utf8(raw_payload).map_err(|error| {
-            CoreError::ContractPayloadEncodingInvalid {
-                tx_id: transaction.id.clone(),
-                reason: error.to_string(),
-            }
-        })?;
-
-        if source.trim().is_empty() {
-            return Ok(());
-        }
 
         let program = compile(source).map_err(|error| CoreError::ContractCompileFailed {
             tx_id: transaction.id.clone(),
@@ -416,67 +433,190 @@ impl Blockchain {
         Ok(())
     }
 
-    /// 在区块确认后推进合约状态与事件日志。
-    fn apply_contract_state_transitions(&mut self, transactions: &[Transaction]) -> CoreResult<()> {
-        for transaction in transactions {
-            if !is_contract_transaction(transaction) {
-                continue;
-            }
-
-            let Some(raw_payload) = transaction.payload.as_ref() else {
-                continue;
-            };
-            if raw_payload.is_empty() {
-                continue;
-            }
-
-            let source = std::str::from_utf8(raw_payload).map_err(|error| {
-                CoreError::ContractPayloadEncodingInvalid {
-                    tx_id: transaction.id.clone(),
-                    reason: error.to_string(),
-                }
-            })?;
-            if source.trim().is_empty() {
-                continue;
-            }
-
-            let program = compile(source).map_err(|error| CoreError::ContractCompileFailed {
+    /// 校验 DeFi 载荷结构与业务前置条件。
+    ///
+    /// 业务校验在借贷池副本上试执行，保证"入池即保证能成功"，
+    /// 避免把必然失败的交易广播给全网。
+    fn validate_defi_payload(&self, transaction: &Transaction) -> CoreResult<()> {
+        let payload = decode_defi_payload(transaction)?;
+        payload
+            .validate()
+            .map_err(|error| CoreError::DefiPayloadInvalid {
                 tx_id: transaction.id.clone(),
                 reason: error.to_string(),
             })?;
-            let initial_state = self
-                .contract_states
-                .get(&transaction.to)
-                .cloned()
-                .unwrap_or_default();
-            let mut runtime = Runtime::from_state(initial_state);
-            runtime
-                .execute(&program)
-                .map_err(|error| CoreError::ContractExecutionFailed {
-                    tx_id: transaction.id.clone(),
-                    reason: error.to_string(),
-                })?;
 
-            self.contract_states
-                .insert(transaction.to.clone(), runtime.state().clone());
-            if !runtime.events().is_empty() {
-                self.contract_events
-                    .entry(transaction.to.clone())
-                    .or_default()
-                    .extend(runtime.events().iter().cloned());
+        // 除清算外，载荷 owner 必须与发送方一致，防止代他人操作仓位。
+        // 清理由第三方清算人对借款人仓位发起，故豁免该校验。
+        if payload.is_self_operated() && payload.owner != transaction.from {
+            return Err(CoreError::DefiOwnerMismatch {
+                owner: payload.owner.clone(),
+                sender: transaction.from.clone(),
+            });
+        }
+
+        let mut probe = self.lending_pool.clone();
+        let result = match payload.action {
+            DefiAction::DepositCollateral => probe
+                .deposit_collateral(&payload.owner, payload.amount)
+                .map(|_| ()),
+            DefiAction::Borrow => probe
+                .borrow(&payload.owner, payload.amount, transaction.timestamp)
+                .map(|_| ()),
+            DefiAction::Repay => probe
+                .repay(&payload.owner, payload.amount, transaction.timestamp)
+                .map(|_| ()),
+            DefiAction::WithdrawCollateral => probe
+                .withdraw_collateral(&payload.owner, payload.amount, transaction.timestamp)
+                .map(|_| ()),
+            DefiAction::Liquidate => probe
+                .liquidate(&payload.owner, payload.amount, transaction.timestamp)
+                .map(|_| ()),
+        };
+
+        result.map_err(|error| CoreError::DefiExecutionFailed {
+            tx_id: transaction.id.clone(),
+            reason: error.to_string(),
+        })
+    }
+
+    /// 在区块确认后推进链上业务状态（合约状态/事件与 DeFi 借贷池）。
+    fn apply_state_transitions(&mut self, transactions: &[Transaction]) -> CoreResult<()> {
+        for transaction in transactions {
+            match transaction.kind {
+                TransactionKind::ContractDeploy | TransactionKind::ContractCall => {
+                    self.apply_contract_transition(transaction)?;
+                }
+                TransactionKind::DefiAction => self.apply_defi_transition(transaction)?,
+                _ => {}
             }
         }
 
         Ok(())
     }
+
+    /// 推进单个合约交易的状态与事件。
+    fn apply_contract_transition(&mut self, transaction: &Transaction) -> CoreResult<()> {
+        let Some(source) = decode_contract_source(transaction)? else {
+            return Ok(());
+        };
+
+        let program = compile(source).map_err(|error| CoreError::ContractCompileFailed {
+            tx_id: transaction.id.clone(),
+            reason: error.to_string(),
+        })?;
+        let initial_state = self
+            .contract_states
+            .get(&transaction.to)
+            .cloned()
+            .unwrap_or_default();
+        let mut runtime = Runtime::from_state(initial_state);
+        runtime
+            .execute(&program)
+            .map_err(|error| CoreError::ContractExecutionFailed {
+                tx_id: transaction.id.clone(),
+                reason: error.to_string(),
+            })?;
+
+        self.contract_states
+            .insert(transaction.to.clone(), runtime.state().clone());
+        if !runtime.events().is_empty() {
+            self.contract_events
+                .entry(transaction.to.clone())
+                .or_default()
+                .extend(runtime.events().iter().cloned());
+        }
+
+        Ok(())
+    }
+
+    /// 推进单个 DeFi 交易对应的借贷池状态。
+    fn apply_defi_transition(&mut self, transaction: &Transaction) -> CoreResult<()> {
+        let payload = decode_defi_payload(transaction)?;
+        payload
+            .validate()
+            .map_err(|error| CoreError::DefiPayloadInvalid {
+                tx_id: transaction.id.clone(),
+                reason: error.to_string(),
+            })?;
+
+        let now_ts = transaction.timestamp;
+        let result = match payload.action {
+            DefiAction::DepositCollateral => self
+                .lending_pool
+                .deposit_collateral(&payload.owner, payload.amount)
+                .map(|_| ()),
+            DefiAction::Borrow => self
+                .lending_pool
+                .borrow(&payload.owner, payload.amount, now_ts)
+                .map(|_| ()),
+            DefiAction::Repay => self
+                .lending_pool
+                .repay(&payload.owner, payload.amount, now_ts)
+                .map(|_| ()),
+            DefiAction::WithdrawCollateral => self
+                .lending_pool
+                .withdraw_collateral(&payload.owner, payload.amount, now_ts)
+                .map(|_| ()),
+            DefiAction::Liquidate => self
+                .lending_pool
+                .liquidate(&payload.owner, payload.amount, now_ts)
+                .map(|_| ()),
+        };
+
+        result.map_err(|error| CoreError::DefiExecutionFailed {
+            tx_id: transaction.id.clone(),
+            reason: error.to_string(),
+        })
+    }
 }
 
-/// 判断交易是否属于合约执行语义。
-fn is_contract_transaction(transaction: &Transaction) -> bool {
-    matches!(
-        transaction.kind,
-        TransactionKind::ContractDeploy | TransactionKind::ContractCall
-    )
+/// 判断交易是否属于"内部动作"。
+///
+/// 这类交易的 `amount` 表达的是业务数量（如抵押品数量），而非账户间转账金额，
+/// 因此不应影响账户余额。DeFi 动作目前是唯一的内部动作类型。
+fn is_internal_action(transaction: &Transaction) -> bool {
+    matches!(transaction.kind, TransactionKind::DefiAction)
+}
+
+/// 解码合约源码；非合约交易或空载荷返回 `None`。
+fn decode_contract_source(transaction: &Transaction) -> CoreResult<Option<&str>> {
+    let Some(raw_payload) = transaction.payload.as_ref() else {
+        return Ok(None);
+    };
+    if raw_payload.is_empty() {
+        return Ok(None);
+    }
+
+    let source = std::str::from_utf8(raw_payload).map_err(|error| {
+        CoreError::ContractPayloadEncodingInvalid {
+            tx_id: transaction.id.clone(),
+            reason: error.to_string(),
+        }
+    })?;
+
+    if source.trim().is_empty() {
+        return Ok(None);
+    }
+
+    Ok(Some(source))
+}
+
+/// 解码 DeFi 载荷，缺失或非法时返回可读错误。
+fn decode_defi_payload(transaction: &Transaction) -> CoreResult<DefiPayload> {
+    let raw_payload =
+        transaction
+            .payload
+            .as_ref()
+            .ok_or_else(|| CoreError::DefiPayloadInvalid {
+                tx_id: transaction.id.clone(),
+                reason: "缺少 DeFi 载荷".to_string(),
+            })?;
+
+    DefiPayload::decode(raw_payload).map_err(|error| CoreError::DefiPayloadInvalid {
+        tx_id: transaction.id.clone(),
+        reason: error.to_string(),
+    })
 }
 
 #[cfg(test)]
@@ -778,6 +918,214 @@ mod tests {
                 .latest_block_difficulty()
                 .expect("应可读取最新区块难度"),
             2
+        );
+    }
+
+    /// 构造一笔已签名的 DeFi 交易，便于复用。
+    fn signed_defi_tx(
+        wallet: &rustchain_crypto::wallet::Wallet,
+        key_pair: &rustchain_crypto::wallet::WalletKeyPair,
+        action: DefiAction,
+        owner: &str,
+        amount: u64,
+        nonce: u64,
+        timestamp: i64,
+    ) -> Transaction {
+        let payload = DefiPayload::new(action, owner, amount)
+            .encode()
+            .expect("载荷编码应成功");
+        let mut tx = Transaction::new_with_kind(
+            TransactionKind::DefiAction,
+            wallet.address.clone(),
+            "defi-lending-pool",
+            amount,
+            nonce,
+            Some(payload),
+        );
+        // 用固定时间戳替代构造时的当前时间，保证计息可预测。
+        tx.timestamp = timestamp;
+        tx.sign_with_private_key(&key_pair.private_key, &key_pair.public_key)
+            .expect("交易签名应当成功");
+        tx
+    }
+
+    /// 验证 DeFi 抵押交易在出块前不改变借贷池，出块后才推进状态。
+    #[test]
+    fn defi_deposit_should_apply_only_after_mining() {
+        let (wallet, key_pair) = create_wallet("defi-pass").expect("创建钱包应当成功");
+        let mut blockchain = Blockchain::new(1, 50);
+        blockchain
+            .mine_pending_transactions(wallet.address.clone())
+            .expect("首次挖矿应成功");
+
+        let tx = signed_defi_tx(
+            &wallet,
+            &key_pair,
+            DefiAction::DepositCollateral,
+            &wallet.address,
+            200,
+            0,
+            0,
+        );
+        blockchain.add_transaction(tx).expect("抵押交易应入池");
+
+        // 入池阶段只做试执行校验，不得改动链上借贷池。
+        assert!(blockchain.lending_pool.positions.is_empty());
+        assert_eq!(blockchain.lending_pool.total_collateral, 0);
+
+        blockchain
+            .mine_pending_transactions("miner-2")
+            .expect("出块应成功");
+
+        let position = blockchain
+            .lending_pool
+            .positions
+            .get(&wallet.address)
+            .expect("应存在仓位");
+        assert_eq!(position.collateral_amount, 200);
+        assert_eq!(blockchain.lending_pool.total_collateral, 200);
+    }
+
+    /// 验证抵押后可借款，且借款后抵押率被正确记录。
+    #[test]
+    fn defi_borrow_after_deposit_should_work() {
+        let (wallet, key_pair) = create_wallet("defi-pass").expect("创建钱包应当成功");
+        let mut blockchain = Blockchain::new(1, 50);
+        blockchain
+            .mine_pending_transactions(wallet.address.clone())
+            .expect("首次挖矿应成功");
+
+        let deposit = signed_defi_tx(
+            &wallet,
+            &key_pair,
+            DefiAction::DepositCollateral,
+            &wallet.address,
+            300,
+            0,
+            0,
+        );
+        blockchain.add_transaction(deposit).expect("抵押应入池");
+        blockchain
+            .mine_pending_transactions("miner-2")
+            .expect("出块应成功");
+
+        let borrow = signed_defi_tx(
+            &wallet,
+            &key_pair,
+            DefiAction::Borrow,
+            &wallet.address,
+            100,
+            1,
+            1,
+        );
+        blockchain.add_transaction(borrow).expect("借款应入池");
+        blockchain
+            .mine_pending_transactions("miner-3")
+            .expect("出块应成功");
+
+        let position = blockchain
+            .lending_pool
+            .positions
+            .get(&wallet.address)
+            .expect("应存在仓位");
+        assert_eq!(position.debt_amount, 100);
+        assert_eq!(position.collateral_ratio_bps, 30_000);
+    }
+
+    /// 验证超额借款会在入池阶段就被拒绝，不会进入交易池。
+    #[test]
+    fn defi_over_borrow_should_be_rejected_at_mempool() {
+        let (wallet, key_pair) = create_wallet("defi-pass").expect("创建钱包应当成功");
+        let mut blockchain = Blockchain::new(1, 50);
+        blockchain
+            .mine_pending_transactions(wallet.address.clone())
+            .expect("首次挖矿应成功");
+
+        let deposit = signed_defi_tx(
+            &wallet,
+            &key_pair,
+            DefiAction::DepositCollateral,
+            &wallet.address,
+            100,
+            0,
+            0,
+        );
+        blockchain.add_transaction(deposit).expect("抵押应入池");
+        blockchain
+            .mine_pending_transactions("miner-2")
+            .expect("出块应成功");
+
+        // 抵押 100 最多借出约 66，借 100 必然触发抵押率不足。
+        let borrow = signed_defi_tx(
+            &wallet,
+            &key_pair,
+            DefiAction::Borrow,
+            &wallet.address,
+            100,
+            1,
+            1,
+        );
+        let result = blockchain.add_transaction(borrow);
+
+        assert!(
+            matches!(result, Err(CoreError::DefiExecutionFailed { .. })),
+            "超额借款应被拒绝，实际: {result:?}"
+        );
+        assert_eq!(blockchain.pending_transactions.len(), 0);
+    }
+
+    /// 验证非清算动作不允许代他人操作仓位。
+    #[test]
+    fn defi_action_on_other_owner_should_be_rejected() {
+        let (alice_wallet, alice_key) = create_wallet("alice-pass").expect("创建钱包应当成功");
+        let (bob_wallet, _) = create_wallet("bob-pass").expect("创建钱包应当成功");
+        let mut blockchain = Blockchain::new(1, 50);
+        blockchain
+            .mine_pending_transactions(alice_wallet.address.clone())
+            .expect("首次挖矿应成功");
+
+        // alice 签名，但载荷 owner 写成 bob。
+        let tx = signed_defi_tx(
+            &alice_wallet,
+            &alice_key,
+            DefiAction::DepositCollateral,
+            &bob_wallet.address,
+            50,
+            0,
+            0,
+        );
+        let result = blockchain.add_transaction(tx);
+
+        assert!(
+            matches!(result, Err(CoreError::DefiOwnerMismatch { .. })),
+            "代他人操作应被拒绝，实际: {result:?}"
+        );
+    }
+
+    /// 验证缺失载荷的 DeFi 交易会被拒绝。
+    #[test]
+    fn defi_transaction_without_payload_should_be_rejected() {
+        let (wallet, key_pair) = create_wallet("defi-pass").expect("创建钱包应当成功");
+        let mut blockchain = Blockchain::new(1, 50);
+        blockchain
+            .mine_pending_transactions(wallet.address.clone())
+            .expect("首次挖矿应成功");
+
+        let mut tx = Transaction::new_with_kind(
+            TransactionKind::DefiAction,
+            wallet.address.clone(),
+            "defi-lending-pool",
+            10,
+            0,
+            None,
+        );
+        tx.sign_with_private_key(&key_pair.private_key, &key_pair.public_key)
+            .expect("交易签名应当成功");
+
+        let result = blockchain.add_transaction(tx);
+        assert!(
+            matches!(result, Err(CoreError::DefiPayloadInvalid { .. })),
+            "缺失载荷应被拒绝，实际: {result:?}"
         );
     }
 }

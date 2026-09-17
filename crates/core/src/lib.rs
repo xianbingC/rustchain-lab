@@ -1,5 +1,6 @@
 pub mod block;
 pub mod blockchain;
+pub mod defi_payload;
 pub mod error;
 pub mod hash;
 pub mod merkle;

@@ -5,8 +5,10 @@ license.workspace = true
 version.workspace = true
 
 [dependencies]
+bincode.workspace = true
 chrono.workspace = true
 hex.workspace = true
+rustchain-apps = { path = "../apps" }
 rustchain-crypto = { path = "../crypto" }
 rustchain-vm = { path = "../vm" }
 serde.workspace = true

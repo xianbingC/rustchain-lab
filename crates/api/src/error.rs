@@ -4,7 +4,6 @@
 //! 保证接口层状态码策略集中在一处，避免各 handler 自行决定。
 
 use axum::http::StatusCode;
-use rustchain_apps::defi::DefiError;
 use rustchain_apps::nft::NftError;
 use rustchain_p2p::P2pError;
 use rustchain_storage::error::StorageError;
@@ -17,21 +16,6 @@ use serde_json::json;
 /// 内部只保存裸 `Value`，由调用方在 `Err` 分支统一包一层 `Json`，
 /// 这样 `map_*_error` 既能用于 `with_*` 辅助函数，也能直接构造响应。
 pub(crate) type ApiError = (StatusCode, serde_json::Value);
-
-/// DeFi 业务错误映射为 HTTP 错误响应。
-pub(crate) fn map_defi_error(error: DefiError) -> ApiError {
-    let status = match error {
-        DefiError::ArithmeticOverflow => StatusCode::INTERNAL_SERVER_ERROR,
-        _ => StatusCode::BAD_REQUEST,
-    };
-    (
-        status,
-        json!({
-            "ok": false,
-            "error": error.to_string()
-        }),
-    )
-}
 
 /// NFT 业务错误映射为 HTTP 错误响应。
 pub(crate) fn map_nft_error(error: NftError) -> ApiError {
@@ -50,8 +34,10 @@ pub(crate) fn map_nft_error(error: NftError) -> ApiError {
 
 /// 核心链错误映射为 HTTP 错误响应。
 ///
-/// 结构性/共识性错误意味着本地链数据本身不可信，归为 500；
-/// 其余（余额不足、签名非法、合约失败等）属于请求问题，归为 400。
+/// 映射原则：
+/// - 结构性/共识性错误意味着本地链数据本身不可信 → 500
+/// - 资源不存在（仓位/余额等查询目标缺失）→ 404
+/// - 其余（余额不足、签名非法、合约失败等）属于请求问题 → 400
 pub(crate) fn map_core_error(error: rustchain_core::error::CoreError) -> ApiError {
     let status = match error {
         rustchain_core::error::CoreError::EmptyChain
@@ -64,6 +50,7 @@ pub(crate) fn map_core_error(error: rustchain_core::error::CoreError) -> ApiErro
         | rustchain_core::error::CoreError::InvalidBlockIndex { .. } => {
             StatusCode::INTERNAL_SERVER_ERROR
         }
+        rustchain_core::error::CoreError::DefiPositionNotFound { .. } => StatusCode::NOT_FOUND,
         _ => StatusCode::BAD_REQUEST,
     };
     (
