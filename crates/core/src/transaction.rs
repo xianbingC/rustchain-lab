@@ -77,14 +77,7 @@ impl Transaction {
         amount: u64,
         payload: Option<Vec<u8>>,
     ) -> Self {
-        Self::new_with_kind(
-            TransactionKind::Transfer,
-            from,
-            to,
-            amount,
-            0,
-            payload,
-        )
+        Self::new_with_kind(TransactionKind::Transfer, from, to, amount, 0, payload)
     }
 
     /// 创建自定义类型交易，便于后续合约、DeFi、NFT 场景复用。
@@ -220,9 +213,8 @@ impl Transaction {
             .as_deref()
             .ok_or(crate::error::CoreError::MissingSenderPublicKey)?;
 
-        let derived_address = derive_address_from_public_key(sender_public_key).map_err(|error| {
-            crate::error::CoreError::CryptoOperationFailed(error.to_string())
-        })?;
+        let derived_address = derive_address_from_public_key(sender_public_key)
+            .map_err(|error| crate::error::CoreError::CryptoOperationFailed(error.to_string()))?;
         if self.from != derived_address {
             return Err(crate::error::CoreError::SenderAddressMismatch);
         }

@@ -1,7 +1,4 @@
-use crate::{
-    error::StorageError,
-    StorageResult as Result,
-};
+use crate::{error::StorageError, StorageResult as Result};
 use std::{
     collections::HashMap,
     sync::{Mutex, MutexGuard},
@@ -200,9 +197,7 @@ mod tests {
     fn in_memory_account_balance_roundtrip_should_work() {
         let store = InMemoryStateStore::new();
 
-        store
-            .set_balance("alice", 88)
-            .expect("写入余额应当成功");
+        store.set_balance("alice", 88).expect("写入余额应当成功");
         let balance = store.get_balance("alice").expect("读取余额应当成功");
 
         assert_eq!(balance, Some(88));

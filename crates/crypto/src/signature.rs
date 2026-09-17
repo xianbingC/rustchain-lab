@@ -53,8 +53,8 @@ pub fn verify_message(
 
     let mut public_key_array = [0u8; PUBLIC_KEY_LEN];
     public_key_array.copy_from_slice(&public_key);
-    let verifying_key = VerifyingKey::from_bytes(&public_key_array)
-        .map_err(|_| CryptoError::InvalidSignature)?;
+    let verifying_key =
+        VerifyingKey::from_bytes(&public_key_array).map_err(|_| CryptoError::InvalidSignature)?;
 
     let mut signature_array = [0u8; SIGNATURE_LEN];
     signature_array.copy_from_slice(&signature_bytes);
@@ -92,8 +92,8 @@ mod tests {
         let message = b"rustchain-signature-check";
         let signature = sign_message(message, &key_pair.private_key).expect("签名应当成功");
 
-        let verified = verify_message(message, &signature, &wallet.public_key)
-            .expect("验签应当成功");
+        let verified =
+            verify_message(message, &signature, &wallet.public_key).expect("验签应当成功");
         assert!(verified);
     }
 
